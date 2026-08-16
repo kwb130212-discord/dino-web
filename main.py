@@ -13,7 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import aiohttp
-import httpx  # [FIX] 콜백에서 사용하지만 원본에 import가 없어 auth/callback 호출 시 NameError로 크래시났음
+import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import uvicorn
@@ -45,8 +45,6 @@ def now_kst_str() -> str:
 def fmt_won(n: int) -> str:
     return f"{n:,}원"
 
-# [FIX] 라이센스 키 / 복구 키 / 백업 키는 예측 불가능해야 하므로
-# random 대신 secrets(암호학적으로 안전한 난수)를 사용하는 헬퍼로 통일
 def gen_secure_code(n: int) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(n))
@@ -153,8 +151,6 @@ class DB:
                 key TEXT PRIMARY KEY, guild_id BIGINT NOT NULL, created_by BIGINT NOT NULL, created_at TEXT NOT NULL,
                 is_used INTEGER DEFAULT 0, expires_at TEXT
             )""",
-            # [FIX] 추방/차단 버튼이 재시작 후에도 올바른 대상에 동작하도록
-            # 메시지 ID -> 대상 유저 ID 매핑을 DB에 영구 저장
             """CREATE TABLE IF NOT EXISTS mod_action_targets (
                 message_id BIGINT PRIMARY KEY, guild_id BIGINT NOT NULL, target_user_id BIGINT NOT NULL, created_at TEXT NOT NULL
             )"""
@@ -213,12 +209,13 @@ async def send_purchase_receipt(guild: discord.Guild, buyer: discord.abc.User, i
         try:
             await channel.send(embed=embed)
             return "channel"
-        except: pass
+        except Exception:
+            pass
     try:
         embed.description = f"**{guild.name}** 서버에서의 구매 영수증입니다."
         await buyer.send(embed=embed)
         return "dm"
-    except:
+    except Exception:
         return "failed"
 
 def admin_only():
@@ -294,11 +291,6 @@ class MainVendingView(discord.ui.View):
 
                         price = it_info["price"]
 
-                        # [FIX] 재고 차감은 원자적(WHERE stock>0)으로 이미 되어 있었지만
-                        # 포인트 차감은 "먼저 조회 후 차감" 방식이라 동시에 여러 번 누르면
-                        # 잔액보다 많이 구매되는 레이스 컨디션이 있었음.
-                        # -> 포인트도 WHERE points >= price 조건으로 원자적으로 차감하고,
-                        #    실패하면(rowcount 0) 방금 깎은 재고를 되돌린다.
                         if it_info["stock"] != -1:
                             cur.execute("UPDATE prices SET stock=stock-1 WHERE guild_id=%s AND item=%s AND stock>0", (i.guild_id, item_name))
                             if cur.rowcount == 0:
@@ -310,7 +302,6 @@ class MainVendingView(discord.ui.View):
                             (price, i.guild_id, i.user.id, price)
                         )
                         if cur.rowcount == 0:
-                            # 포인트 부족 -> 재고 차감했던 것 롤백
                             if it_info["stock"] != -1:
                                 cur.execute("UPDATE prices SET stock=stock+1 WHERE guild_id=%s AND item=%s", (i.guild_id, item_name))
                             conn.commit()
@@ -357,7 +348,7 @@ class TicketControlView(discord.ui.View):
         await asyncio.sleep(3)
         try:
             await interaction.channel.delete(reason=f"티켓 종료 (실행자: {interaction.user})")
-        except:
+        except Exception:
             pass
 
 class TicketSelectView(discord.ui.View):
@@ -425,16 +416,9 @@ class TicketSelectView(discord.ui.View):
         await interaction.response.send_message(f"✅ 티켓 채널이 생성되었습니다: {ticket_channel.mention}", ephemeral=True)
 
 class LogAdminActionView(discord.ui.View):
-    """
-    [FIX] 원래는 target_user_id를 인스턴스 속성(self.target_id)에만 저장했음.
-    이 View는 timeout=None(영구 View)이라 봇 재시작 후에도 버튼이 눌릴 수 있는데,
-    재시작하면 self.target_id 정보가 사라져서 엉뚱한 유저를 추방/차단하게 되는 버그가 있었음.
-    -> custom_id는 고정값으로 유지해 persistent view로 정상 등록되게 하고,
-       실제 대상 유저 ID는 DB(mod_action_targets)에 message_id 기준으로 저장해서 조회한다.
-    """
     def __init__(self, target_user_id: int = 0):
         super().__init__(timeout=None)
-        self.target_id = target_user_id  # 최초 전송 시점의 폴백용
+        self.target_id = target_user_id
 
     async def _resolve_target_id(self, interaction: discord.Interaction) -> int:
         row = DB.fetchone("SELECT target_user_id FROM mod_action_targets WHERE message_id = ?", interaction.message.id)
@@ -482,7 +466,6 @@ class SystemCog(commands.Cog):
         if 일수 <= 0:
             return await interaction.response.send_message("❌ 라이센스 기간은 1일 이상이어야 합니다.", ephemeral=True)
 
-        # [FIX] random.choices -> secrets 기반 안전한 난수로 교체 (예측/전수조사 방지)
         license_key = f"LIC-{gen_secure_code(4)}-{gen_secure_code(4)}-{gen_secure_code(4)}"
 
         DB.execute("INSERT INTO licenses (license_key, duration_days, is_used) VALUES (?, ?, 0)", license_key, 일수)
@@ -526,7 +509,6 @@ class SystemCog(commands.Cog):
     @app_commands.command(name="복구키생성", description="인원 복구를 위한 복구 키를 생성합니다. (30분간만 유효)")
     @admin_only()
     async def create_recovery_key(self, interaction: discord.Interaction):
-        # [FIX] random.choices -> secrets 기반 안전한 난수
         rec_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -548,7 +530,6 @@ class SystemCog(commands.Cog):
         if not row or row["guild_id"] != interaction.guild_id:
             return await interaction.response.send_message("❌ 이 서버에서 발급된 키가 아니거나 존재하지 않는 키입니다.", ephemeral=True)
 
-        # 기존 키는 즉시 사용불가 처리 (유출 대응)
         DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 기존키)
 
         new_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
@@ -571,27 +552,23 @@ class SystemCog(commands.Cog):
         if not row:
             return await interaction.response.send_message("❌ 유효하지 않은 복구 키입니다.", ephemeral=True)
 
-        # [FIX] 원래는 어느 서버에서 만든 키인지 검사하지 않아서,
-        # 다른 서버의 복구 키를 알아내면 그 서버의 유저 토큰으로 내 서버에
-        # 강제 초대할 수 있는 심각한 크로스 서버 유출/오남용이 가능했음.
         if row["guild_id"] != interaction.guild_id:
             return await interaction.response.send_message("❌ 이 복구 키는 다른 서버에서 생성된 키입니다.", ephemeral=True)
 
-        # [FIX] 재사용 방지 (원래는 무제한 재사용 가능했음)
         if row.get("is_used"):
             return await interaction.response.send_message("❌ 이미 사용되었거나 리셋으로 무효화된 복구 키입니다.", ephemeral=True)
 
-        # [NEW] 30분 시한부 검증 — 유출되더라도 오남용 가능한 시간을 최소화
         exp_str = row.get("expires_at")
         if exp_str:
             exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
             if datetime.now(KST) >= exp_dt:
-                DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 복구키)  # 만료된 키는 사용 불가 처리
+                DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 복구키)
                 return await interaction.response.send_message("❌ 이 복구 키는 30분 유효시간이 지나 만료되었습니다. `/복구키생성`으로 새로 발급받아 주세요.", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
-        tokens = DB.fetchall("SELECT user_id, access_token FROM user_tokens WHERE guild_id = ?", row["guild_id"])
+        # [FIX] 해당 길드에 귀속된 토큰만 조회하도록 수정
+        tokens = DB.fetchall("SELECT user_id, access_token FROM user_tokens WHERE guild_id = ?", interaction.guild_id)
         if not tokens:
             return await interaction.followup.send("❌ 복구할 수 있는 연동된 유저 토큰이 없습니다.", ephemeral=True)
 
@@ -657,7 +634,6 @@ class SystemCog(commands.Cog):
             "roles": roles_data, "categories": categories_data, "no_category_channels": no_cat_channels
         }
 
-        # [FIX] random -> secrets
         bkey = f"BK-{gen_secure_code(10)}"
         DB.execute("INSERT INTO server_backups (backup_key, guild_id, backup_data, created_at) VALUES (?,?,?,?)", bkey, g, json.dumps(data), now_kst_str())
         await interaction.followup.send(f"✅ 백업 완료!\n복구 키: `{bkey}`", ephemeral=True)
@@ -669,8 +645,6 @@ class SystemCog(commands.Cog):
         row = DB.fetchone("SELECT guild_id, backup_data FROM server_backups WHERE backup_key=?", 백업키)
         if not row: return await interaction.followup.send("❌ 유효하지 않은 백업 키입니다.", ephemeral=True)
 
-        # [FIX] 원래는 어느 서버의 백업인지 확인하지 않아서, 다른 서버의 백업 키를
-        # 알아내면 그 서버의 상점/설정 데이터를 내 서버로 가져올 수 있었음.
         if row["guild_id"] != interaction.guild_id:
             return await interaction.followup.send("❌ 이 백업 키는 다른 서버에서 생성된 키입니다.", ephemeral=True)
 
@@ -684,7 +658,7 @@ class SystemCog(commands.Cog):
         for r_info in data.get("roles", []):
             try:
                 await guild.create_role(name=r_info["name"], color=discord.Color(r_info["color"]), hoist=r_info["hoist"], mentionable=r_info["mentionable"], permissions=discord.Permissions(r_info["permissions"]))
-            except: pass
+            except Exception: pass
 
         for cat_info in data.get("categories", []):
             try:
@@ -692,13 +666,13 @@ class SystemCog(commands.Cog):
                 for ch_info in cat_info.get("channels", []):
                     if ch_info["type"] == "voice": await guild.create_voice_channel(ch_info["name"], category=new_cat)
                     else: await guild.create_text_channel(ch_info["name"], category=new_cat, topic=ch_info.get("topic"))
-            except: pass
+            except Exception: pass
 
         for ch_info in data.get("no_category_channels", []):
             try:
                 if ch_info["type"] == "voice": await guild.create_voice_channel(ch_info["name"])
                 else: await guild.create_text_channel(ch_info["name"], topic=ch_info.get("topic"))
-            except: pass
+            except Exception: pass
 
         await interaction.followup.send("✅ 서버 구조 및 데이터 복구 완료!", ephemeral=True)
 
@@ -748,9 +722,6 @@ class EconomyCog(commands.Cog):
         if 금액 <= 0:
             return await interaction.response.send_message("❌ 올바른 금액을 입력하세요.", ephemeral=True)
 
-        # [FIX] 원래는 잔액을 "조회만" 하고 실제로 차감하지 않아서,
-        # 같은 잔액으로 출금 신청을 무한히 넣을 수 있었음(잔액 검증이 매번 통과됨).
-        # -> 신청 시점에 포인트를 원자적으로 차감(보류금 성격)한다.
         rowcount = DB.execute(
             "UPDATE user_points SET points=points-? WHERE guild_id=? AND user_id=? AND points>=?",
             금액, interaction.guild_id, interaction.user.id, 금액
@@ -766,8 +737,6 @@ class EconomyCog(commands.Cog):
         if 금액 <= 0 or 유저.bot or 유저 == interaction.user:
             return await interaction.response.send_message("❌ 송금 불가 조건입니다.", ephemeral=True)
 
-        # [FIX] 잔액 확인과 차감이 분리되어 있어 동시에 여러 번 실행 시
-        # 잔액보다 많은 금액이 송금되는 레이스 컨디션이 있었음 -> 원자적 조건부 UPDATE로 변경
         rowcount = DB.execute(
             "UPDATE user_points SET points=points-? WHERE guild_id=? AND user_id=? AND points>=?",
             금액, interaction.guild_id, interaction.user.id, 금액
@@ -822,8 +791,6 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="상품등록", description="새 상품을 상점에 올립니다.")
     @seller_only()
     async def add_item(self, interaction: discord.Interaction, 카테고리: str, 상품명: str, 가격: int, 재고: int = -1):
-        # [FIX] 가격이 음수여도 검증 없이 등록되어, "구매"하면 오히려 포인트가 증가하는
-        # 방식으로 악용될 수 있었음. 재고도 -1(무제한) 외 음수는 무의미하므로 함께 검증.
         if 가격 < 0:
             return await interaction.response.send_message("❌ 가격은 0 이상이어야 합니다.", ephemeral=True)
         if 재고 < -1:
@@ -1025,7 +992,7 @@ class DinoBot(commands.Bot):
         self.add_view(VerifyView())
         self.add_view(TicketSelectView())
         self.add_view(TicketControlView())
-        self.add_view(LogAdminActionView())  # [FIX] 재시작 후에도 추방/차단 버튼이 동작하도록 persistent 등록
+        self.add_view(LogAdminActionView())
 
 bot = DinoBot()
 
@@ -1083,7 +1050,6 @@ async def on_member_remove(member: discord.Member):
     embed.add_field(name="🔄 총 방문 횟수", value=f"총 {join_count}회 드나듦", inline=False)
 
     sent = await ch.send(embed=embed, view=LogAdminActionView(member.id))
-    # [FIX] 재시작 후에도 이 메시지의 버튼이 올바른 대상을 가리키도록 message_id -> target_id 매핑 저장
     DB.execute(
         "INSERT INTO mod_action_targets (message_id, guild_id, target_user_id, created_at) VALUES (?,?,?,?) "
         "ON CONFLICT (message_id) DO UPDATE SET target_user_id=EXCLUDED.target_user_id",
@@ -1095,7 +1061,6 @@ async def on_member_remove(member: discord.Member):
 # ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 웹 서버가 켜질 때 백그라운드 태스크로 디스코드 봇 구동
     bot_task = asyncio.create_task(bot.start(TOKEN))
     yield
     await bot.close()
@@ -1133,13 +1098,13 @@ async def callback(code: str, state: str = None):
         token_data = token_resp.json()
 
         if "access_token" not in token_data:
-            return """
+            return HTMLResponse(content="""
             <!DOCTYPE html>
             <html lang="ko">
             <head><meta charset="UTF-8"><title>인증 실패</title>
             <style>body{background:#0f172a;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}.card{background:#1e293b;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid #334155;}</style>
             </head><body><div class="card"><h2 style="color:#f87171;">❌ 인증 실패</h2><p>디스코드 토큰을 발급받지 못했습니다.<br>다시 시도해 주세요.</p></div></body></html>
-            """
+            """, status_code=400)
 
         access_token = token_data["access_token"]
         refresh_token = token_data.get("refresh_token")
@@ -1154,8 +1119,6 @@ async def callback(code: str, state: str = None):
         avatar = user_data.get("avatar")
         avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png" if avatar else "https://cdn.discordapp.com/embed/avatars/0.png"
 
-        # [FIX] state 값이 올바른 정수가 아닐 때 int(state)에서 예외가 나면
-        # 조용히 무시되고 "인증 성공" 화면만 보여주는 문제가 있었음 -> 미리 검증
         guild_id_int = None
         if state:
             try:
@@ -1221,7 +1184,7 @@ async def callback(code: str, state: str = None):
             except Exception as e:
                 print(f"❌ DB 연동 또는 로그 전송 오류: {e}")
 
-    return f"""
+    html_content = f"""
     <!DOCTYPE html>
     <html lang="ko">
     <head>
@@ -1328,6 +1291,7 @@ async def callback(code: str, state: str = None):
     </body>
     </html>
     """
+    return HTMLResponse(content=html_content, status_code=200)
 
 # ==============================================================================
 # 8. 메인 실행 진입점
@@ -1335,6 +1299,5 @@ async def callback(code: str, state: str = None):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN 설정 필요.")
-    # [FIX] Render는 포트를 $PORT 환경변수로 지정하므로 고정된 8000 대신 이를 사용
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
