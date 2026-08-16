@@ -1338,4 +1338,3 @@ if __name__ == "__main__":
     # [FIX] Render는 포트를 $PORT 환경변수로 지정하므로 고정된 8000 대신 이를 사용
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-외주 받아온 코드 사용법 라이브러리 등등 알려
