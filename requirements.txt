@@ -1,3 +1,7 @@
+discord.py
+python-dotenv
+aiohttp
+httpx
+psycopg2-binary
 fastapi
 uvicorn
-httpx
