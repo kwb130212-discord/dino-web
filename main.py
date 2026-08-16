@@ -113,7 +113,7 @@ class DB:
                 license_key TEXT PRIMARY KEY, duration_days INTEGER NOT NULL, is_used INTEGER DEFAULT 0, used_by_guild INTEGER, used_at TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id INTEGER PRIMARY KEY, receipt_channel_id INTEGER, welcome_channel_id INTEGER, log_channel_id INTEGER, verify_role_id INTEGER, ticket_category_id INTEGER, ticket_role_id INTEGER, ticket_message TEXT, verify_log_channel_id INTEGER
+                guild_id INTEGER PRIMARY KEY, receipt_channel_id INTEGER, welcome_channel_id INTEGER, log_channel_id INTEGER, verify_role_id INTEGER, ticket_category_id INTEGER, ticket_role_id INTEGER, ticket_message TEXT, verify_log_channel_id INTEGER, auth_log_channel_id INTEGER
             )""",
             """CREATE TABLE IF NOT EXISTS bot_admins (
                 guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, added_by INTEGER NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (guild_id, user_id)
@@ -151,6 +151,9 @@ class DB:
             )""",
             """CREATE TABLE IF NOT EXISTS mod_action_targets (
                 message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, target_user_id INTEGER NOT NULL, created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS leaved_members (
+                guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, user_name TEXT NOT NULL, PRIMARY KEY (guild_id, user_id)
             )"""
         ]
         with DB.get_connection() as conn:
@@ -592,6 +595,21 @@ class SystemCog(commands.Cog):
             ephemeral=True
         )
 
+    @app_commands.command(name="복구대상", description="현재 서버에 없는(퇴장한) 복구 가능 인원 목록과 인원수를 확인합니다.")
+    @admin_only()
+    async def check_restorable(self, interaction: discord.Interaction):
+        targets = DB.fetchall("SELECT user_name FROM leaved_members WHERE guild_id = ?", interaction.guild_id)
+        
+        if not targets:
+            await interaction.response.send_message("현재 복구 가능한 인원이 없습니다.", ephemeral=True)
+        else:
+            count = len(targets)
+            target_list = "\n".join([f"• {name['user_name']}" for name in targets])
+            await interaction.response.send_message(
+                f"📋 **현재 즉시 복구 가능 인원 (총 {count}명):**\n{target_list}",
+                ephemeral=True
+            )
+
     @app_commands.command(name="서버백업", description="상점 및 서버의 역할, 카테고리, 채널 구조를 백업합니다.")
     @admin_only()
     async def backup_server(self, interaction: discord.Interaction):
@@ -924,6 +942,15 @@ class AdminSetupCog(commands.Cog):
         """, interaction.guild_id, 채널.id)
         await interaction.response.send_message(f"✅ 인증 로그 채널 설정: {채널.mention}", ephemeral=True)
 
+    @app_commands.command(name="인증로그설정", description="인증 완료 로그가 전송될 채널을 설정합니다.")
+    @admin_only()
+    async def set_auth_log_channel(self, interaction: discord.Interaction, 채널: discord.TextChannel):
+        DB.execute("""
+            INSERT INTO guild_settings (guild_id, auth_log_channel_id) VALUES (?,?) 
+            ON CONFLICT (guild_id) DO UPDATE SET auth_log_channel_id=excluded.auth_log_channel_id
+        """, interaction.guild_id, 채널.id)
+        await interaction.response.send_message(f"✅ 인증 로그 채널이 {채널.mention}으로 설정되었습니다.", ephemeral=True)
+
     @app_commands.command(name="인증역할설정", description="인증 완료 시 줄 역할")
     @admin_only()
     async def set_vrole(self, interaction: discord.Interaction, 역할: discord.Role):
@@ -1009,6 +1036,9 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    # 나갔던 멤버가 다시 들어오면 복구 대상 목록에서 삭제
+    DB.execute("DELETE FROM leaved_members WHERE guild_id = ? AND user_id = ?", member.guild.id, member.id)
+
     DB.execute("""
         INSERT INTO user_join_counts (guild_id, user_id, join_count) VALUES (?, ?, 1) 
         ON CONFLICT (guild_id, user_id) DO UPDATE SET join_count = join_count + 1
@@ -1027,6 +1057,12 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    # 멤버가 나갈 때 복구 대상 목록에 추가
+    DB.execute("""
+        INSERT INTO leaved_members (guild_id, user_id, user_name) VALUES (?, ?, ?)
+        ON CONFLICT (guild_id, user_id) DO UPDATE SET user_name = excluded.user_name
+    """, member.guild.id, member.id, member.name)
+
     row_cnt = DB.fetchone("SELECT join_count FROM user_join_counts WHERE guild_id=? AND user_id=?", member.guild.id, member.id)
     join_count = row_cnt["join_count"] if row_cnt else 1
 
@@ -1088,7 +1124,7 @@ async def callback(code: str, state: str = None):
         token_data = token_resp.json()
 
         if "access_token" not in token_data:
-            return HTMLResponse(content="""
+            return HTMLResponse(content=""""
             <!DOCTYPE html>
             <html lang="ko">
             <head><meta charset="UTF-8"><title>인증 실패</title>
@@ -1141,20 +1177,31 @@ async def callback(code: str, state: str = None):
                             )
                     conn.commit()
 
-                targets = []
+                # 인증 완료 시 웹 연동 로그 + 새로 만든 인증로그 채널 동시 발송 처리
+                targets_verify = []
+                targets_auth = []
                 with DB.get_connection() as conn:
                     cur = conn.cursor()
                     if guild_id_int is not None:
-                        cur.execute("SELECT verify_log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id_int,))
-                        targets = cur.fetchall()
+                        cur.execute("SELECT verify_log_channel_id, auth_log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id_int,))
+                        row_res = cur.fetchone()
+                        if row_res:
+                            if row_res["verify_log_channel_id"]:
+                                targets_verify.append(row_res["verify_log_channel_id"])
+                            if row_res["auth_log_channel_id"]:
+                                targets_auth.append(row_res["auth_log_channel_id"])
                     else:
-                        cur.execute("SELECT verify_log_channel_id FROM guild_settings WHERE verify_log_channel_id IS NOT NULL")
-                        targets = cur.fetchall()
+                        cur.execute("SELECT verify_log_channel_id, auth_log_channel_id FROM guild_settings")
+                        for r_row in cur.fetchall():
+                            if r_row["verify_log_channel_id"]:
+                                targets_verify.append(r_row["verify_log_channel_id"])
+                            if r_row["auth_log_channel_id"]:
+                                targets_auth.append(r_row["auth_log_channel_id"])
 
                 if TOKEN:
-                    for row in targets:
-                        ch_id = row["verify_log_channel_id"]
-                        if ch_id:
+                    async with httpx.AsyncClient() as log_client:
+                        # 기존 웹 연동 로그 전송
+                        for ch_id in targets_verify:
                             embed_payload = {
                                 "embeds": [{
                                     "title": "🔓 웹 연동 인증 완료",
@@ -1165,12 +1212,22 @@ async def callback(code: str, state: str = None):
                                     "timestamp": datetime.now(timezone.utc).isoformat()
                                 }]
                             }
-                            async with httpx.AsyncClient() as log_client:
-                                await log_client.post(
-                                    f"https://discord.com/api/v10/channels/{ch_id}/messages",
-                                    headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
-                                    json=embed_payload
-                                )
+                            await log_client.post(
+                                f"https://discord.com/api/v10/channels/{ch_id}/messages",
+                                headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
+                                json=embed_payload
+                            )
+                        
+                        # 새로 추가된 /인증로그설정 채널로 로그 전송
+                        for ch_id in targets_auth:
+                            auth_payload = {
+                                "content": f"✅ **인증 완료:** {username} 님이 인증을 완료했습니다."
+                            }
+                            await log_client.post(
+                                f"https://discord.com/api/v10/channels/{ch_id}/messages",
+                                headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
+                                json=auth_payload
+                            )
             except Exception as e:
                 print(f"❌ DB 연동 또는 로그 전송 오류: {e}")
 
