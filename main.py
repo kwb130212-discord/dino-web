@@ -1123,7 +1123,7 @@ class AdminSetupCog(commands.Cog):
         """, interaction.guild_id, 채널.id)
         await interaction.response.send_message(f"✅ 멤버 입퇴장 로그 채널이 {채널.mention}로 설정되었습니다.", ephemeral=True)
 
-    @app_commands.command(name="인증로그채널설정", description="웹 연동 인증 완료 로그를 받을 채널을 지정합니다.")
+    @app_commands.command(name="인증로그", description="웹 연동 인증 완료 로그를 받을 채널을 지정합니다.")
     @admin_only()
     async def set_verify_log(self, interaction: discord.Interaction, 채널: discord.TextChannel):
         if not interaction.guild_id:
@@ -1311,7 +1311,6 @@ app = FastAPI(lifespan=lifespan)
 def home():
     return {"status": "Auth Server Running with Local SQLite (Stability Enhanced)"}
 
-# HEAD 요청 차단(405 Method Not Allowed) 방지를 위한 HEAD 라우트 추가
 @app.head("/")
 def home_head():
     return {}
