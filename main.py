@@ -1311,6 +1311,11 @@ app = FastAPI(lifespan=lifespan)
 def home():
     return {"status": "Auth Server Running with Local SQLite (Stability Enhanced)"}
 
+# HEAD 요청 차단(405 Method Not Allowed) 방지를 위한 HEAD 라우트 추가
+@app.head("/")
+def home_head():
+    return {}
+
 @app.get("/login")
 def login(guild_id: str = None):
     auth_url = (
@@ -1320,6 +1325,10 @@ def login(guild_id: str = None):
     if guild_id:
         auth_url += f"&state={guild_id}"
     return RedirectResponse(auth_url)
+
+@app.head("/login")
+def login_head(guild_id: str = None):
+    return {}
 
 @app.get("/auth/callback", response_class=HTMLResponse)
 async def callback(request: Request, code: str, state: str = None):
@@ -1594,6 +1603,10 @@ async def callback(request: Request, code: str, state: str = None):
     </html>
     """
     return HTMLResponse(content=html_content, status_code=200)
+
+@app.head("/auth/callback")
+def callback_head():
+    return {}
 
 # ==============================================================================
 # 8. 메인 실행 진입점
