@@ -34,6 +34,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "https://dino-web-2trw.onrender.com/auth/callback")
+DATABASE_URL = os.getenv("DATABASE_URL", "database.db")[span_1](start_span)[span_1](end_span)
 
 ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "! !디노")
 KST = timezone(timedelta(hours=9))
@@ -69,7 +70,9 @@ class SafeRow(dict):
 
 class DB:
     """SQLite 로컬 데이터베이스 연결을 위한 정적 매니저 클래스"""
-    DB_NAME = "database.db"
+    DB_NAME = DATABASE_URL if not DATABASE_URL.startswith("sqlite:///+") and not DATABASE_URL.startswith("sqlite:///") else DATABASE_URL.replace("sqlite:///", "").replace("sqlite:///+", "")
+    if DB_NAME.startswith("./"):
+        DB_NAME = DB_NAME[2:]
 
     @staticmethod
     def get_connection():
@@ -1637,28 +1640,25 @@ async def callback(request: Request, code: str, state: str = None):
             p {{
                 color: #94a3b8;
                 font-size: 14px;
-                line-height: 1.6;
+                line-height: 1.5;
                 margin: 0 0 24px 0;
             }}
-            .btn {{
-                background: linear-gradient(135deg, #5865F2 0%, #4752C4 100%);
-                color: white;
+            .btn-close {{
+                background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+                color: #ffffff;
                 border: none;
-                width: 100%;
-                padding: 12px 0;
-                border-radius: 12px;
-                font-weight: 600;
-                cursor: pointer;
+                padding: 12px 24px;
                 font-size: 15px;
-                box-shadow: 0 4px 12px rgba(88, 101, 242, 0.3);
-                transition: all 0.2s ease;
+                font-weight: 600;
+                border-radius: 12px;
+                cursor: pointer;
+                transition: transform 0.2s, box-shadow 0.2s;
+                width: 100%;
+                box-shadow: 0 4px 12px rgba(56, 189, 248, 0.3);
             }}
-            .btn:hover {{
+            .btn-close:hover {{
                 transform: translateY(-2px);
-                box-shadow: 0 6px 16px rgba(88, 101, 242, 0.4);
-            }}
-            .btn:active {{
-                transform: translateY(0);
+                box-shadow: 0 6px 16px rgba(56, 189, 248, 0.4);
             }}
         </style>
     </head>
@@ -1666,24 +1666,12 @@ async def callback(request: Request, code: str, state: str = None):
         <div class="card">
             <img src="{avatar_url}" alt="프로필" class="profile-img">
             <div class="icon-badge">✓</div>
+            <h2><span class="username-highlight">{username}</span>님</h2>
             <h2>인증이 완료되었습니다!</h2>
-            <p><span class="username-highlight">{username}</span> 님의 디스코드 계정 연동 및<br>서버 인증이 성공적으로 처리되었습니다.<br>이제 창을 닫고 디스코드로 돌아가셔도 좋습니다.</p>
-            <button class="btn" onclick="window.close()">창 닫기</button>
+            <p>디스코드 서버로 돌아가면<br>정상적으로 권한과 혜택이 적용됩니다.</p>
+            <button class="btn-close" onclick="window.close()">창 닫기</button>
         </div>
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content, status_code=200)
-
-@app.head("/auth/callback")
-def callback_head():
-    return {}
-
-# ==============================================================================
-# 8. 메인 실행 진입점
-# ==============================================================================
-if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("❌ DISCORD_TOKEN 설정 필요.")
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    return HTMLResponse(content=html_content)
