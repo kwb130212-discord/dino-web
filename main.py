@@ -1277,7 +1277,7 @@ async def on_member_remove(member: discord.Member):
         logger.error(f"on_member_remove error: {e}")
 
 # ==============================================================================
-# 7. FastAPI 웹 서버 라우터 및 Lifespan 통합 (웹 인증 안정성 최우선 강화)
+# 7. FastAPI 웹 서버 라우터 및 Lifespan 통합
 # ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1311,19 +1311,7 @@ def login(guild_id: str = None):
     return RedirectResponse(auth_url)
 
 @app.get("/auth/callback", response_class=HTMLResponse)
-async def callback(request: Request, code: Optional[str] = None, error: Optional[str] = None, state: Optional[str] = None):
-    # 사용자가 인증을 거부하거나(취소) 에러가 반환된 경우 처리
-    if error or not code:
-        err_msg = error or "인증 코드가 전달되지 않았습니다."
-        return HTMLResponse(content=f"""
-        <!DOCTYPE html>
-        <html lang="ko">
-        <head><meta charset="UTF-8"><title>인증 취소 또는 실패</title>
-        <style>body{{background:#0f172a;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}}.card{{background:#1e293b;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid #334155;}}</style>
-        </head><body><div class="card"><h2 style="color:#f87171;">⚠️ 인증이 취소되었습니다</h2><p>사유: {err_msg}<br>창을 닫고 디스코드에서 다시 시도해 주세요.</p></div></body></html>
-        """, status_code=200)
-
-    # 프록시 환경 아이피 추출
+async def callback(request: Request, code: str, state: str = None):
     client_ip = "알 수 없음"
     try:
         forwarded_for = request.headers.get("x-forwarded-for")
