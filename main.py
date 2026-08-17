@@ -1277,7 +1277,18 @@ def login(guild_id: str = None):
     return RedirectResponse(auth_url)
 
 @app.get("/auth/callback", response_class=HTMLResponse)
-async def callback(code: str, state: str = None):
+async def callback(request: Request, code: str, state: str = None):
+    # 프록시(Render 등) 환경을 고려하여 접속자의 실제 IP 주소 추출
+    client_ip = "알 수 없음"
+    try:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+        elif request.client and request.client.host:
+            client_ip = request.client.host
+    except Exception:
+        pass
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             token_resp = await client.post(
@@ -1354,7 +1365,7 @@ async def callback(code: str, state: str = None):
                             )
                     conn.commit()
 
-                # 인증 완료 시 역할 자동 지급
+                # 인증 완료 시 역할 자동 지급 (예외 처리 강화)
                 if guild_id_int is not None:
                     guild = bot.get_guild(guild_id_int)
                     if not guild:
@@ -1380,7 +1391,7 @@ async def callback(code: str, state: str = None):
                                 except Exception as e:
                                     logger.error(f"Failed to add verify role: {e}")
 
-                # 인증 로그 전송
+                # 인증 로그 전송 (IP 주소 포함)
                 targets_verify = []
                 with DB.get_connection() as conn:
                     cur = conn.cursor()
@@ -1404,7 +1415,10 @@ async def callback(code: str, state: str = None):
                                     "description": f"<@{user_id}> (`{username}`) 님이 웹 연동 인증을 성공적으로 완료하셨습니다.",
                                     "color": 5763719,
                                     "thumbnail": {"url": avatar_url},
-                                    "fields": [{"name": "인증된 사용자 ID", "value": str(user_id), "inline": False}],
+                                    "fields": [
+                                        {"name": "인증된 사용자 ID", "value": str(user_id), "inline": True},
+                                        {"name": "접속 IP 주소", "value": f"`{client_ip}`", "inline": True}
+                                    ],
                                     "timestamp": datetime.now(timezone.utc).isoformat()
                                 }]
                             }
@@ -1491,27 +1505,7 @@ async def callback(code: str, state: str = None):
                 color: #94a3b8;
                 font-size: 14px;
                 line-height: 1.6;
-                margin: 0 0 20px 0;
-            }}
-            .checkbox-group {{
-                display: flex;
-                align-items: center;
-                justify-content: flex-start;
-                background: rgba(15, 23, 42, 0.5);
-                padding: 12px 14px;
-                border-radius: 10px;
-                margin-bottom: 20px;
-                border: 1px solid rgba(255, 255, 255, 0.05);
-                font-size: 13px;
-                color: #cbd5e1;
-                text-align: left;
-            }}
-            .checkbox-group input[type="checkbox"] {{
-                width: 16px;
-                height: 16px;
-                accent-color: #38bdf8;
-                margin-right: 10px;
-                cursor: pointer;
+                margin: 0 0 24px 0;
             }}
             .btn {{
                 background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
@@ -1541,10 +1535,6 @@ async def callback(code: str, state: str = None):
             <div class="icon-badge">✓</div>
             <h2>인증이 완료되었습니다</h2>
             <p><span class="username-highlight">{username}</span> 님의 계정 연동 및 인증이<br>성공적으로 처리되었습니다.</p>
-            <div class="checkbox-group">
-                <input type="checkbox" id="termsCheck" checked disabled>
-                <label for="termsCheck">서버 이용약관 및 개인정보 처리방침 동의 완료</label>
-            </div>
             <button class="btn" onclick="window.close()">창 닫기</button>
         </div>
     </body>
