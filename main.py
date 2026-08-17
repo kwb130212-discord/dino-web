@@ -4,6 +4,7 @@ import json
 import secrets
 import string
 import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import quote
@@ -19,6 +20,10 @@ import uvicorn
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from contextlib import asynccontextmanager
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("DinoBot")
 
 # ==============================================================================
 # 1. 환경변수 및 기본 설정 (.env 연동 완료)
@@ -48,44 +53,64 @@ def gen_secure_code(n: int) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(n))
 
 # ==============================================================================
-# 2. 데이터베이스 매니저 (SQLite 로컬 파일 기반)
+# 2. 데이터베이스 매니저 (SQLite 로컬 파일 기반 + WAL 모드 안정성 강화)
 # ==============================================================================
 class DB:
-    """SQLite 로컬 데이터베이스 연결을 위한 정적 매니저 클래스"""
+    """SQLite 로컬 데이터베이스 연결을 위한 정적 매니저 클래스 (동시성 및 안정성 강화)"""
     DB_NAME = "database.db"
 
     @staticmethod
     def get_connection():
-        conn = sqlite3.connect(DB.DB_NAME)
+        conn = sqlite3.connect(DB.DB_NAME, timeout=30.0)
         conn.row_factory = sqlite3.Row
         return conn
 
     @staticmethod
     def fetchone(query: str, *params) -> Optional[dict]:
-        with DB.get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(query, params)
-            row = cur.fetchone()
-            return dict(row) if row else None
+        try:
+            with DB.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(query, params)
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"DB fetchone error: {e} | Query: {query} | Params: {params}")
+            return None
 
     @staticmethod
     def fetchall(query: str, *params) -> list[dict]:
-        with DB.get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(query, params)
-            return [dict(row) for row in cur.fetchall()]
+        try:
+            with DB.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(query, params)
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"DB fetchall error: {e} | Query: {query} | Params: {params}")
+            return []
 
     @staticmethod
     def execute(query: str, *params) -> int:
-        with DB.get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(query, params)
-            rowcount = cur.rowcount
-            conn.commit()
-            return rowcount
+        try:
+            with DB.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(query, params)
+                rowcount = cur.rowcount
+                conn.commit()
+                return rowcount
+        except Exception as e:
+            logger.error(f"DB execute error: {e} | Query: {query} | Params: {params}")
+            return 0
 
     @staticmethod
     def init_db():
+        try:
+            with DB.get_connection() as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to set WAL mode: {e}")
+
         queries = [
             """CREATE TABLE IF NOT EXISTS prices (
                 guild_id INTEGER NOT NULL, item TEXT NOT NULL, category TEXT DEFAULT '기타',
@@ -156,64 +181,96 @@ class DB:
                 guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, user_name TEXT NOT NULL, PRIMARY KEY (guild_id, user_id)
             )"""
         ]
-        with DB.get_connection() as conn:
-            cur = conn.cursor()
-            for q in queries:
-                cur.execute(q)
-            conn.commit()
+        try:
+            with DB.get_connection() as conn:
+                cur = conn.cursor()
+                for q in queries:
+                    cur.execute(q)
+                conn.commit()
+            logger.info("Database initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize database tables: {e}")
 
 # ==============================================================================
-# 3. 유틸리티 및 권한 검사 함수
+# 3. 유틸리티 및 권한 검사 함수 (안전성 및 예외 처리 강화)
 # ==============================================================================
 def get_user_points(guild_id: int, user_id: int) -> int:
     row = DB.fetchone("SELECT points FROM user_points WHERE guild_id = ? AND user_id = ?", guild_id, user_id)
-    return row["points"] if row else 0
+    return row["points"] if row and "points" in row else 0
 
 def is_guild_registered(guild_id: int) -> bool:
     row = DB.fetchone("SELECT expires_at FROM registered_guilds WHERE guild_id = ?", guild_id)
     if not row: return False
     if not row["expires_at"]: return True
-    exp_dt = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-    return datetime.now(KST) < exp_dt
+    try:
+        exp_dt = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+        return datetime.now(KST) < exp_dt
+    except Exception:
+        return False
 
 def is_bot_admin(user: discord.Member, guild_id: int) -> bool:
-    if getattr(user.guild_permissions, 'administrator', False) or any(r.name == ADMIN_ROLE_NAME for r in getattr(user, 'roles', [])):
-        return True
-    return bool(DB.fetchone("SELECT 1 FROM bot_admins WHERE guild_id = ? AND user_id = ?", guild_id, user.id))
+    try:
+        if not user: return False
+        perms = getattr(user, 'guild_permissions', None)
+        if perms and getattr(perms, 'administrator', False):
+            return True
+        roles = getattr(user, 'roles', [])
+        if any(r.name == ADMIN_ROLE_NAME for r in roles):
+            return True
+        return bool(DB.fetchone("SELECT 1 FROM bot_admins WHERE guild_id = ? AND user_id = ?", guild_id, user.id))
+    except Exception:
+        return False
 
 def is_server_admin(user: discord.Member, guild_id: int) -> bool:
     if is_bot_admin(user, guild_id): return True
-    return bool(DB.fetchone("SELECT 1 FROM server_admins WHERE guild_id = ? AND user_id = ?", guild_id, user.id))
+    try:
+        return bool(DB.fetchone("SELECT 1 FROM server_admins WHERE guild_id = ? AND user_id = ?", guild_id, user.id))
+    except Exception:
+        return False
 
 def is_seller(user: discord.Member, guild_id: int) -> bool:
     if is_server_admin(user, guild_id): return True
-    return bool(DB.fetchone("SELECT 1 FROM bot_sellers WHERE guild_id = ? AND user_id = ?", guild_id, user.id))
+    try:
+        return bool(DB.fetchone("SELECT 1 FROM bot_sellers WHERE guild_id = ? AND user_id = ?", guild_id, user.id))
+    except Exception:
+        return False
 
 async def send_purchase_receipt(guild: discord.Guild, buyer: discord.abc.User, item_name: str, qty: int, price: int):
-    row = DB.fetchone("SELECT receipt_channel_id FROM guild_settings WHERE guild_id = ?", guild.id)
-    embed = discord.Embed(title="🧾 구매 영수증", color=discord.Color.green(), timestamp=datetime.now(KST))
-    embed.set_author(name=str(buyer), icon_url=buyer.display_avatar.url)
-    embed.add_field(name="구매자", value=buyer.mention, inline=True)
-    embed.add_field(name="상품명", value=item_name, inline=True)
-    embed.add_field(name="수량", value=f"{qty}개", inline=True)
-    embed.add_field(name="총 결제 금액", value=f"**{fmt_won(price)}**", inline=True)
-
-    channel = guild.get_channel(row["receipt_channel_id"]) if row and row["receipt_channel_id"] else None
-    if channel:
-        try:
-            await channel.send(embed=embed)
-            return "channel"
-        except Exception:
-            pass
     try:
-        embed.description = f"**{guild.name}** 서버에서의 구매 영수증입니다."
-        await buyer.send(embed=embed)
-        return "dm"
-    except Exception:
+        row = DB.fetchone("SELECT receipt_channel_id FROM guild_settings WHERE guild_id = ?", guild.id)
+        embed = discord.Embed(title="🧾 구매 영수증", color=discord.Color.green(), timestamp=datetime.now(KST))
+        avatar_url = buyer.display_avatar.url if hasattr(buyer, 'display_avatar') else None
+        if avatar_url:
+            embed.set_author(name=str(buyer), icon_url=avatar_url)
+        else:
+            embed.set_author(name=str(buyer))
+        embed.add_field(name="구매자", value=buyer.mention, inline=True)
+        embed.add_field(name="상품명", value=item_name, inline=True)
+        embed.add_field(name="수량", value=f"{qty}개", inline=True)
+        embed.add_field(name="총 결제 금액", value=f"**{fmt_won(price)}**", inline=True)
+
+        channel = guild.get_channel(row["receipt_channel_id"]) if row and row.get("receipt_channel_id") else None
+        if channel:
+            try:
+                await channel.send(embed=embed)
+                return "channel"
+            except Exception:
+                pass
+        try:
+            embed.description = f"**{guild.name}** 서버에서의 구매 영수증입니다."
+            await buyer.send(embed=embed)
+            return "dm"
+        except Exception:
+            return "failed"
+    except Exception as e:
+        logger.error(f"send_purchase_receipt error: {e}")
         return "failed"
 
 def admin_only():
     async def predicate(interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
+            return False
         if not is_server_admin(interaction.user, interaction.guild_id):
             await interaction.response.send_message("❌ 서버 관리자만 사용할 수 있습니다.", ephemeral=True)
             return False
@@ -222,6 +279,9 @@ def admin_only():
 
 def seller_only():
     async def predicate(interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
+            return False
         if not is_seller(interaction.user, interaction.guild_id):
             await interaction.response.send_message("❌ 관리자 또는 판매자만 사용할 수 있습니다.", ephemeral=True)
             return False
@@ -255,14 +315,19 @@ class VerifyView(discord.ui.View):
 
 class MainVendingView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
+    
     @discord.ui.button(label="🛒 상품 구매", style=discord.ButtonStyle.blurple, custom_id="vending_buy")
     async def buy_btn(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         categories = DB.fetchall("SELECT DISTINCT category FROM prices WHERE guild_id = ?", interaction.guild_id)
         if not categories: return await interaction.response.send_message("❌ 등록된 카테고리가 없습니다.", ephemeral=True)
 
         view = discord.ui.View(timeout=180)
         select = discord.ui.Select(placeholder="카테고리를 선택하세요")
-        for cat in categories: select.add_option(label=cat["category"], value=cat["category"])
+        for cat in categories: 
+            if cat.get("category"):
+                select.add_option(label=cat["category"], value=cat["category"])
 
         async def select_callback(inter: discord.Interaction):
             items = DB.fetchall("SELECT item, price, stock FROM prices WHERE guild_id = ? AND category = ?", inter.guild_id, select.values[0])
@@ -319,6 +384,8 @@ class MainVendingView(discord.ui.View):
 
     @discord.ui.button(label="📋 상품 목록", style=discord.ButtonStyle.gray, custom_id="vending_products")
     async def list_btn(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         items = DB.fetchall("SELECT item, category, price, stock FROM prices WHERE guild_id = ?", interaction.guild_id)
         if not items: return await interaction.response.send_message("❌ 등록된 상품이 없습니다.", ephemeral=True)
         embed = discord.Embed(title="🛍️ 서버 상품 목록", color=discord.Color.blue())
@@ -341,9 +408,10 @@ class TicketControlView(discord.ui.View):
         DB.execute("DELETE FROM ticket_logs WHERE channel_id = ?", interaction.channel.id)
         await asyncio.sleep(3)
         try:
-            await interaction.channel.delete(reason=f"티켓 종료 (실행자: {interaction.user})")
-        except Exception:
-            pass
+            if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+                await interaction.channel.delete(reason=f"티켓 종료 (실행자: {interaction.user})")
+        except Exception as e:
+            logger.error(f"Failed to delete ticket channel: {e}")
 
 class TicketSelectView(discord.ui.View):
     def __init__(self):
@@ -361,6 +429,8 @@ class TicketSelectView(discord.ui.View):
     async def ticket_select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
         guild = interaction.guild
         user = interaction.user
+        if not guild:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         val = select.values[0]
 
         existing = DB.fetchone("SELECT channel_id FROM ticket_logs WHERE guild_id = ? AND owner_id = ?", guild.id, user.id)
@@ -372,8 +442,8 @@ class TicketSelectView(discord.ui.View):
                 DB.execute("DELETE FROM ticket_logs WHERE channel_id = ?", existing["channel_id"])
 
         settings = DB.fetchone("SELECT ticket_category_id, ticket_role_id FROM guild_settings WHERE guild_id = ?", guild.id)
-        category = guild.get_category(settings["ticket_category_id"]) if settings and settings["ticket_category_id"] else None
-        staff_role = guild.get_role(settings["ticket_role_id"]) if settings and settings["ticket_role_id"] else None
+        category = guild.get_category(settings["ticket_category_id"]) if settings and settings.get("ticket_category_id") else None
+        staff_role = guild.get_role(settings["ticket_role_id"]) if settings and settings.get("ticket_role_id") else None
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -416,12 +486,14 @@ class LogAdminActionView(discord.ui.View):
 
     async def _resolve_target_id(self, interaction: discord.Interaction) -> int:
         row = DB.fetchone("SELECT target_user_id FROM mod_action_targets WHERE message_id = ?", interaction.message.id)
-        if row:
+        if row and row.get("target_user_id"):
             return row["target_user_id"]
         return self.target_id
 
     @discord.ui.button(label="추방(Kick)", style=discord.ButtonStyle.danger, custom_id="mod_kick")
     async def kick_btn(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if not is_server_admin(interaction.user, interaction.guild_id):
             return await interaction.response.send_message("❌ 서버 관리자만 사용할 수 있습니다.", ephemeral=True)
         target_id = await self._resolve_target_id(interaction)
@@ -435,6 +507,8 @@ class LogAdminActionView(discord.ui.View):
 
     @discord.ui.button(label="차단(Ban)", style=discord.ButtonStyle.secondary, custom_id="mod_ban")
     async def ban_btn(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if not is_server_admin(interaction.user, interaction.guild_id):
             return await interaction.response.send_message("❌ 서버 관리자만 사용할 수 있습니다.", ephemeral=True)
         target_id = await self._resolve_target_id(interaction)
@@ -447,7 +521,7 @@ class LogAdminActionView(discord.ui.View):
             await interaction.response.send_message(f"❌ 차단 실패: {e}", ephemeral=True)
 
 # ==============================================================================
-# 5. Cogs (명령어 모듈화)
+# 5. Cogs (명령어 모듈화 - 전체 37개 명령어 완벽 보존 및 안정성 강화)
 # ==============================================================================
 class SystemCog(commands.Cog):
     def __init__(self, bot): self.bot = bot
@@ -471,14 +545,19 @@ class SystemCog(commands.Cog):
 
     @app_commands.command(name="라이센스등록", description="서버 라이센스를 등록합니다.")
     async def register_license(self, interaction: discord.Interaction, 라이센스키: str):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         lic = DB.fetchone("SELECT * FROM licenses WHERE license_key = ? AND is_used = 0", 라이센스키)
         if not lic: return await interaction.response.send_message("❌ 유효하지 않거나 이미 사용된 키입니다.", ephemeral=True)
         cur_exp = DB.fetchone("SELECT expires_at FROM registered_guilds WHERE guild_id = ?", interaction.guild_id)
 
         start_dt = datetime.now(KST)
-        if cur_exp and cur_exp["expires_at"]:
-            dt = datetime.strptime(cur_exp["expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-            start_dt = max(start_dt, dt)
+        if cur_exp and cur_exp.get("expires_at"):
+            try:
+                dt = datetime.strptime(cur_exp["expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+                start_dt = max(start_dt, dt)
+            except Exception:
+                pass
 
         exp_str = (start_dt + timedelta(days=lic["duration_days"])).strftime("%Y-%m-%d %H:%M:%S")
         DB.execute("UPDATE licenses SET is_used=1, used_by_guild=?, used_at=? WHERE license_key=?", interaction.guild_id, now_kst_str(), 라이센스키)
@@ -493,11 +572,13 @@ class SystemCog(commands.Cog):
 
     @app_commands.command(name="서버정보", description="서버 상태와 라이센스를 확인합니다.")
     async def server_info(self, interaction: discord.Interaction):
+        if not interaction.guild_id or not interaction.guild:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         is_reg = is_guild_registered(interaction.guild_id)
         exp = DB.fetchone("SELECT expires_at FROM registered_guilds WHERE guild_id = ?", interaction.guild_id)
         embed = discord.Embed(title=f"📊 {interaction.guild.name} 서버 정보", color=discord.Color.blue())
         embed.add_field(name="라이센스 승인", value="✅ 승인됨" if is_reg else "❌ 미승인", inline=True)
-        if exp and exp["expires_at"]: embed.add_field(name="만료일", value=exp["expires_at"], inline=True)
+        if exp and exp.get("expires_at"): embed.add_field(name="만료일", value=exp["expires_at"], inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="복구키생성", description="인원 복구를 위한 복구 키를 생성합니다. (30분간만 유효)")
@@ -521,7 +602,7 @@ class SystemCog(commands.Cog):
     @admin_only()
     async def reset_recovery_key(self, interaction: discord.Interaction, 기존키: str):
         row = DB.fetchone("SELECT guild_id FROM recovery_keys WHERE key = ?", 기존키)
-        if not row or row["guild_id"] != interaction.guild_id:
+        if not row or row.get("guild_id") != interaction.guild_id:
             return await interaction.response.send_message("❌ 이 서버에서 발급된 키가 아니거나 존재하지 않는 키입니다.", ephemeral=True)
 
         DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 기존키)
@@ -546,18 +627,21 @@ class SystemCog(commands.Cog):
         if not row:
             return await interaction.response.send_message("❌ 유효하지 않은 복구 키입니다.", ephemeral=True)
 
-        if row["guild_id"] != interaction.guild_id:
+        if row.get("guild_id") != interaction.guild_id:
             return await interaction.response.send_message("❌ 이 복구 키는 다른 서버에서 생성된 키입니다.", ephemeral=True)
 
-        if row["is_used"]:
+        if row.get("is_used"):
             return await interaction.response.send_message("❌ 이미 사용되었거나 리셋으로 무효화된 복구 키입니다.", ephemeral=True)
 
-        exp_str = row["expires_at"]
+        exp_str = row.get("expires_at")
         if exp_str:
-            exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-            if datetime.now(KST) >= exp_dt:
-                DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 복구키)
-                return await interaction.response.send_message("❌ 이 복구 키는 30분 유효시간이 지나 만료되었습니다. `/복구키생성`으로 새로 발급받아 주세요.", ephemeral=True)
+            try:
+                exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+                if datetime.now(KST) >= exp_dt:
+                    DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 복구키)
+                    return await interaction.response.send_message("❌ 이 복구 키는 30분 유효시간이 지나 만료되었습니다. `/복구키생성`으로 새로 발급받아 주세요.", ephemeral=True)
+            except Exception:
+                pass
 
         await interaction.response.defer(ephemeral=True)
 
@@ -568,6 +652,9 @@ class SystemCog(commands.Cog):
         success_count = 0
         fail_count = 0
         guild = interaction.guild
+        if not guild:
+            return await interaction.followup.send("❌ 서버 정보를 찾을 수 없습니다.", ephemeral=True)
+
         headers = {
             "Authorization": f"Bot {interaction.client.http.token}",
             "Content-Type": "application/json"
@@ -580,11 +667,14 @@ class SystemCog(commands.Cog):
                 url = f"https://discord.com/api/v10/guilds/{guild.id}/members/{user_id}"
                 payload = {"access_token": access_token}
 
-                async with session.put(url, headers=headers, json=payload) as resp:
-                    if resp.status in (201, 204):
-                        success_count += 1
-                    else:
-                        fail_count += 1
+                try:
+                    async with session.put(url, headers=headers, json=payload, timeout=10) as resp:
+                        if resp.status in (201, 204):
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                except Exception:
+                    fail_count += 1
 
         DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 복구키)
 
@@ -604,7 +694,7 @@ class SystemCog(commands.Cog):
             await interaction.response.send_message("현재 복구 가능한 인원이 없습니다.", ephemeral=True)
         else:
             count = len(targets)
-            target_list = "\n".join([f"• {name['user_name']}" for name in targets])
+            target_list = "\n".join([f"• {name['user_name']}" for name in targets if name.get("user_name")])
             await interaction.response.send_message(
                 f"📋 **현재 즉시 복구 가능 인원 (총 {count}명):**\n{target_list}",
                 ephemeral=True
@@ -615,6 +705,8 @@ class SystemCog(commands.Cog):
     async def backup_server(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
+        if not guild:
+            return await interaction.followup.send("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         g = guild.id
 
         roles_data = []
@@ -653,11 +745,17 @@ class SystemCog(commands.Cog):
         row = DB.fetchone("SELECT guild_id, backup_data FROM server_backups WHERE backup_key=?", 백업키)
         if not row: return await interaction.followup.send("❌ 유효하지 않은 백업 키입니다.", ephemeral=True)
 
-        if row["guild_id"] != interaction.guild_id:
+        if row.get("guild_id") != interaction.guild_id:
             return await interaction.followup.send("❌ 이 백업 키는 다른 서버에서 생성된 키입니다.", ephemeral=True)
 
-        data = json.loads(row["backup_data"])
+        try:
+            data = json.loads(row["backup_data"])
+        except Exception:
+            return await interaction.followup.send("❌ 백업 데이터 손상으로 복구할 수 없습니다.", ephemeral=True)
+
         guild = interaction.guild
+        if not guild:
+            return await interaction.followup.send("❌ 서버 정보를 찾을 수 없습니다.", ephemeral=True)
 
         DB.execute("DELETE FROM prices WHERE guild_id=?", guild.id)
         for p in data.get("prices", []):
@@ -687,7 +785,9 @@ class SystemCog(commands.Cog):
     @app_commands.command(name="공지발송", description="임베드로 공지를 발송합니다.")
     @admin_only()
     async def send_notice(self, interaction: discord.Interaction, 내용: str):
-        embed = discord.Embed(title="📢 공지사항", description=내용, color=discord.Color.red())
+        if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        embed = discord.Embed(title="📢 공지사항", description=내용, color=discord.Color.red(), timestamp=datetime.now(KST))
         await interaction.channel.send(embed=embed)
         await interaction.response.send_message("✅ 전송 완료", ephemeral=True)
 
@@ -696,22 +796,31 @@ class SystemCog(commands.Cog):
     async def clear_msg(self, interaction: discord.Interaction, 개수: int):
         if 개수 <= 0:
             return await interaction.response.send_message("❌ 1개 이상의 개수를 입력하세요.", ephemeral=True)
+        if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        deleted = await interaction.channel.purge(limit=min(개수, 100))
-        await interaction.followup.send(f"✅ {len(deleted)}개 삭제 완료.", ephemeral=True)
+        try:
+            deleted = await interaction.channel.purge(limit=min(개수, 100))
+            await interaction.followup.send(f"✅ {len(deleted)}개 삭제 완료.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 메시지 삭제 실패: {e}", ephemeral=True)
 
 class EconomyCog(commands.Cog):
     def __init__(self, bot): self.bot = bot
 
     @app_commands.command(name="포인트조회", description="내 포인트를 확인합니다.")
     async def check_pts(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         await interaction.response.send_message(f"💰 내 포인트: **{fmt_won(get_user_points(interaction.guild_id, interaction.user.id))}**", ephemeral=True)
 
     @app_commands.command(name="내정보", description="내 활동 프로필을 확인합니다.")
     async def my_info(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         pts = get_user_points(interaction.guild_id, interaction.user.id)
         tx_row = DB.fetchone("SELECT COUNT(*) as c FROM transactions WHERE guild_id=? AND buyer_id=?", interaction.guild_id, interaction.user.id)
-        tx = tx_row["c"] if tx_row else 0
+        tx = tx_row["c"] if tx_row and "c" in tx_row else 0
         embed = discord.Embed(title=f"👤 {interaction.user.display_name} 님 정보", color=discord.Color.blue())
         embed.add_field(name="💰 보유 포인트", value=fmt_won(pts), inline=True)
         embed.add_field(name="🛒 누적 구매", value=f"{tx}회", inline=True)
@@ -719,6 +828,8 @@ class EconomyCog(commands.Cog):
 
     @app_commands.command(name="내구매내역", description="최근 구매 기록을 봅니다.")
     async def my_tx(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         rows = DB.fetchall("SELECT item, total_price, created_at FROM transactions WHERE guild_id=? AND buyer_id=? ORDER BY id DESC LIMIT 5", interaction.guild_id, interaction.user.id)
         if not rows: return await interaction.response.send_message("❌ 내역이 없습니다.", ephemeral=True)
         embed = discord.Embed(title="📦 구매 내역", color=discord.Color.blue())
@@ -727,6 +838,8 @@ class EconomyCog(commands.Cog):
 
     @app_commands.command(name="출금신청", description="포인트를 현금 환전/출금합니다.")
     async def withdraw_pts(self, interaction: discord.Interaction, 금액: int):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 금액 <= 0:
             return await interaction.response.send_message("❌ 올바른 금액을 입력하세요.", ephemeral=True)
 
@@ -742,6 +855,8 @@ class EconomyCog(commands.Cog):
 
     @app_commands.command(name="송금하기", description="포인트를 선물합니다.")
     async def send_pts(self, interaction: discord.Interaction, 유저: discord.Member, 금액: int):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 금액 <= 0 or 유저.bot or 유저 == interaction.user:
             return await interaction.response.send_message("❌ 송금 불가 조건입니다.", ephemeral=True)
 
@@ -755,12 +870,14 @@ class EconomyCog(commands.Cog):
         DB.execute("""
             INSERT INTO user_points (guild_id, user_id, points) VALUES (?,?,?) 
             ON CONFLICT (guild_id, user_id) DO UPDATE SET points = points + excluded.points
-        """, interaction.guild_id, 유저.id,금액)
+        """, interaction.guild_id, 유저.id, 금액)
         await interaction.response.send_message(f"✅ {유저.mention}님께 {fmt_won(금액)} 송금 완료.", ephemeral=True)
 
     @app_commands.command(name="포인트지급", description="관리자가 포인트를 지급합니다.")
     @seller_only()
     async def admin_give_pts(self, interaction: discord.Interaction, 유저: discord.Member, 금액: int):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 금액 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 금액을 입력하세요.", ephemeral=True)
         DB.execute("""
@@ -772,6 +889,8 @@ class EconomyCog(commands.Cog):
     @app_commands.command(name="포인트차감", description="관리자가 포인트를 차감합니다.")
     @seller_only()
     async def admin_sub_pts(self, interaction: discord.Interaction, 유저: discord.Member, 금액: int):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 금액 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 금액을 입력하세요.", ephemeral=True)
         DB.execute("UPDATE user_points SET points=MAX(0, points-?) WHERE guild_id=? AND user_id=?", (금액, interaction.guild_id, 유저.id))
@@ -782,14 +901,20 @@ class ShopCog(commands.Cog):
 
     @app_commands.command(name="상점목록", description="판매 상품을 조회합니다.")
     async def shop_list(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         items = DB.fetchall("SELECT item, category, price, stock FROM prices WHERE guild_id=?", interaction.guild_id)
         if not items: return await interaction.response.send_message("❌ 상품이 없습니다.", ephemeral=True)
         embed = discord.Embed(title="🛍️ 상품 목록", color=discord.Color.green())
-        for it in items: embed.add_field(name=f"[{it['category']}] {it['item']}", value=f"{fmt_won(it['price'])} | 재고: {it['stock'] if it['stock']!=-1 else '무제한'}", inline=False)
+        for it in items: 
+            stk = f"{it['stock']}개" if it['stock'] != -1 else "무제한"
+            embed.add_field(name=f"[{it['category']}] {it['item']}", value=f"{fmt_won(it['price'])} | 재고: {stk}", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="상품검색", description="상품을 검색합니다.")
     async def search_item(self, interaction: discord.Interaction, 검색어: str):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         items = DB.fetchall("SELECT item, category, price FROM prices WHERE guild_id=? AND item LIKE ?", interaction.guild_id, f"%{검색어}%")
         if not items: return await interaction.response.send_message("❌ 결과 없음.", ephemeral=True)
         embed = discord.Embed(title=f"🔍 '{검색어}' 검색 결과", color=discord.Color.blue())
@@ -799,6 +924,8 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="상품등록", description="새 상품을 상점에 올립니다.")
     @seller_only()
     async def add_item(self, interaction: discord.Interaction, 카테고리: str, 상품명: str, 가격: int, 재고: int = -1):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 가격 < 0:
             return await interaction.response.send_message("❌ 가격은 0 이상이어야 합니다.", ephemeral=True)
         if 재고 < -1:
@@ -812,15 +939,19 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="재고수정", description="상품 재고를 특정 수량으로 덮어씁니다.")
     @seller_only()
     async def set_stock(self, interaction: discord.Interaction, 상품명: str, 재고: int):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 재고 < -1:
             return await interaction.response.send_message("❌ 재고는 -1(무제한) 이상이어야 합니다.", ephemeral=True)
-        res = DB.execute("UPDATE prices SET stock=? WHERE guild_id=? AND item=?", 재고, interaction.guild_id, 상품명)
+        res = DB.execute("UPDATE prices SET stock=? WHERE guild_id=? AND item=?",재고, interaction.guild_id, 상품명)
         if res == 0: return await interaction.response.send_message("❌ 상품을 찾을 수 없습니다.", ephemeral=True)
         await interaction.response.send_message(f"✅ {상품명} 재고가 {재고}개로 변경됨.", ephemeral=True)
 
     @app_commands.command(name="재고추가", description="상품 재고를 늘립니다.")
     @seller_only()
     async def add_stock(self, interaction: discord.Interaction, 상품명: str, 수량: int):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 수량 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 수량을 입력하세요.", ephemeral=True)
         res = DB.execute("UPDATE prices SET stock=stock+? WHERE guild_id=? AND item=? AND stock != -1", 수량, interaction.guild_id, 상품명)
@@ -830,6 +961,8 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="재고차감", description="상품 재고를 줄입니다.")
     @seller_only()
     async def sub_stock(self, interaction: discord.Interaction, 상품명: str, 수량: int):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 수량 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 수량을 입력하세요.", ephemeral=True)
         res = DB.execute("UPDATE prices SET stock=MAX(0, stock-?) WHERE guild_id=? AND item=? AND stock != -1", (수량, interaction.guild_id, 상품명))
@@ -839,6 +972,8 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="자판기패널전송", description="자판기 UI 패널을 설치합니다.")
     @admin_only()
     async def send_vending(self, interaction: discord.Interaction):
+        if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         embed = discord.Embed(title="🛒 자판기", description="버튼을 눌러 상품을 구매하세요.", color=discord.Color.from_rgb(52, 152, 219))
         await interaction.channel.send(embed=embed, view=MainVendingView())
         await interaction.response.send_message("✅ 자판기 전송 완료", ephemeral=True)
@@ -849,8 +984,10 @@ class TicketCog(commands.Cog):
     @app_commands.command(name="티켓패널", description="고급 티켓 생성 패널을 현재 채널에 전송합니다.")
     @admin_only()
     async def send_ticket_panel(self, interaction: discord.Interaction):
+        if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         row = DB.fetchone("SELECT ticket_message FROM guild_settings WHERE guild_id = ?", interaction.guild_id)
-        custom_desc = row["ticket_message"] if row and row["ticket_message"] else (
+        custom_desc = row["ticket_message"] if row and row.get("ticket_message") else (
             "서버 이용 중 도움이 필요하시거나 상품 관련 문의가 있으신가요?\n"
             "아래 메뉴에서 **문의 유형**을 선택하시면 전용 1:1 상담 채널이 자동으로 생성됩니다!\n\n"
             "• **상품 구매 및 충전 문의** 💳\n"
@@ -877,6 +1014,8 @@ class TicketCog(commands.Cog):
         역할: Optional[discord.Role] = None,
         메시지: Optional[str] = None
     ):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         cat_id = 카테고리.id if 카테고리 else None
         role_id = 역할.id if 역할 else None
 
@@ -900,24 +1039,32 @@ class AdminSetupCog(commands.Cog):
     @app_commands.command(name="봇관리자등록", description="봇 권한 관리자를 지정합니다.")
     @admin_only()
     async def add_bot_admin(self, interaction: discord.Interaction, 유저: discord.Member):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         DB.execute("INSERT OR IGNORE INTO bot_admins (guild_id, user_id, added_by, added_at) VALUES (?,?,?,?)", interaction.guild_id, 유저.id, interaction.user.id, now_kst_str())
         await interaction.response.send_message(f"✅ {유저.mention} 봇 관리자 등록 완료.", ephemeral=True)
 
     @app_commands.command(name="서버관리자등록", description="서버 관리자를 지정합니다.")
     @admin_only()
     async def add_srv_admin(self, interaction: discord.Interaction, 유저: discord.Member):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         DB.execute("INSERT OR IGNORE INTO server_admins (guild_id, user_id, added_by, added_at) VALUES (?,?,?,?)", interaction.guild_id, 유저.id, interaction.user.id, now_kst_str())
         await interaction.response.send_message(f"✅ {유저.mention} 서버 관리자 등록 완료.", ephemeral=True)
 
     @app_commands.command(name="판매자등록", description="상점 판매자를 등록합니다.")
     @admin_only()
     async def add_seller(self, interaction: discord.Interaction, 유저: discord.Member):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         DB.execute("INSERT OR IGNORE INTO bot_sellers (guild_id, user_id, added_by, added_at) VALUES (?,?,?,?)", interaction.guild_id, 유저.id, interaction.user.id, now_kst_str())
         await interaction.response.send_message(f"✅ {유저.mention} 판매자 등록 완료.", ephemeral=True)
 
     @app_commands.command(name="영수증채널설정", description="구매 영수증 로그 채널 지정")
     @admin_only()
     async def set_receipt(self, interaction: discord.Interaction, 채널: discord.TextChannel):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         DB.execute("""
             INSERT INTO guild_settings (guild_id, receipt_channel_id) VALUES (?,?) 
             ON CONFLICT (guild_id) DO UPDATE SET receipt_channel_id=excluded.receipt_channel_id
@@ -927,6 +1074,8 @@ class AdminSetupCog(commands.Cog):
     @app_commands.command(name="입퇴장로그설정", description="유저 입퇴장/밴 알림 채널 지정")
     @admin_only()
     async def set_log(self, interaction: discord.Interaction, 채널: discord.TextChannel):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         DB.execute("""
             INSERT INTO guild_settings (guild_id, log_channel_id) VALUES (?,?) 
             ON CONFLICT (guild_id) DO UPDATE SET log_channel_id=excluded.log_channel_id
@@ -936,6 +1085,8 @@ class AdminSetupCog(commands.Cog):
     @app_commands.command(name="인증로그채널설정", description="웹 연동 인증 완료 로그 채널 지정")
     @admin_only()
     async def set_verify_log(self, interaction: discord.Interaction, 채널: discord.TextChannel):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         DB.execute("""
             INSERT INTO guild_settings (guild_id, verify_log_channel_id) VALUES (?,?) 
             ON CONFLICT (guild_id) DO UPDATE SET verify_log_channel_id=excluded.verify_log_channel_id
@@ -945,6 +1096,8 @@ class AdminSetupCog(commands.Cog):
     @app_commands.command(name="인증역할설정", description="인증 완료 시 줄 역할")
     @admin_only()
     async def set_vrole(self, interaction: discord.Interaction, 역할: discord.Role):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         DB.execute("""
             INSERT INTO guild_settings (guild_id, verify_role_id) VALUES (?,?) 
             ON CONFLICT (guild_id) DO UPDATE SET verify_role_id=excluded.verify_role_id
@@ -954,6 +1107,8 @@ class AdminSetupCog(commands.Cog):
     @app_commands.command(name="인증패널전송", description="유저 인증 버튼 설치")
     @admin_only()
     async def send_vpanel(self, interaction: discord.Interaction):
+        if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         embed = discord.Embed(title="🔒 유저 인증", description="버튼을 눌러 인증하세요.", color=discord.Color.green())
         await interaction.channel.send(embed=embed, view=VerifyView(interaction.guild.id))
@@ -964,6 +1119,7 @@ class OwnerPrefixCog(commands.Cog):
 
     @commands.command(name="서버등록")
     async def reg_srv(self, ctx, gid: str = None, days: int = 30):
+        if not ctx.guild: return
         if not (await self.bot.is_owner(ctx.author) or is_bot_admin(ctx.author, ctx.guild.id)): return
         tgt = int(gid) if gid else ctx.guild.id
         exp = (datetime.now(KST) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -975,10 +1131,14 @@ class OwnerPrefixCog(commands.Cog):
 
     @commands.command(name="강제동기화")
     async def force_sync(self, ctx):
+        if not ctx.guild: return
         if not (await self.bot.is_owner(ctx.author) or is_bot_admin(ctx.author, ctx.guild.id)): return
         msg = await ctx.send("🔄 동기화 중...")
-        await self.bot.tree.sync()
-        await msg.edit(content="✅ 글로벌 재동기화 완료!")
+        try:
+            await self.bot.tree.sync()
+            await msg.edit(content="✅ 글로벌 재동기화 완료!")
+        except Exception as e:
+            await msg.edit(content=f"❌ 동기화 실패: {e}")
 
 # ==============================================================================
 # 6. 메인 봇 클래스 및 이벤트
@@ -1001,6 +1161,7 @@ class DinoBot(commands.Bot):
         self.add_view(TicketSelectView())
         self.add_view(TicketControlView())
         self.add_view(LogAdminActionView())
+        logger.info("DinoBot setup_hook completed successfully.")
 
 bot = DinoBot()
 
@@ -1027,65 +1188,83 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    DB.execute("DELETE FROM leaved_members WHERE guild_id = ? AND user_id = ?", member.guild.id, member.id)
+    try:
+        DB.execute("DELETE FROM leaved_members WHERE guild_id = ? AND user_id = ?", member.guild.id, member.id)
 
-    DB.execute("""
-        INSERT INTO user_join_counts (guild_id, user_id, join_count) VALUES (?, ?, 1) 
-        ON CONFLICT (guild_id, user_id) DO UPDATE SET join_count = join_count + 1
-    """, member.guild.id, member.id)
-    row_cnt = DB.fetchone("SELECT join_count FROM user_join_counts WHERE guild_id=? AND user_id=?", member.guild.id, member.id)
-    join_count = row_cnt["join_count"] if row_cnt else 1
+        DB.execute("""
+            INSERT INTO user_join_counts (guild_id, user_id, join_count) VALUES (?, ?, 1) 
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET join_count = join_count + 1
+        """, member.guild.id, member.id)
+        row_cnt = DB.fetchone("SELECT join_count FROM user_join_counts WHERE guild_id=? AND user_id=?", member.guild.id, member.id)
+        join_count = row_cnt["join_count"] if row_cnt and "join_count" in row_cnt else 1
 
-    row = DB.fetchone("SELECT log_channel_id FROM guild_settings WHERE guild_id=?", member.guild.id)
-    if row and row["log_channel_id"]:
-        ch = member.guild.get_channel(row["log_channel_id"])
-        if ch:
-            embed = discord.Embed(title="📥 멤버 가입", description=f"{member.mention} 님이 입장하셨습니다.", color=discord.Color.green(), timestamp=datetime.now(KST))
-            embed.set_thumbnail(url=member.display_avatar.url)
-            embed.add_field(name="🔄 방문 횟수", value=f"총 {join_count}번째 입장", inline=False)
-            await ch.send(embed=embed)
+        row = DB.fetchone("SELECT log_channel_id FROM guild_settings WHERE guild_id=?", member.guild.id)
+        if row and row.get("log_channel_id"):
+            ch = member.guild.get_channel(row["log_channel_id"])
+            if ch and isinstance(ch, discord.TextChannel):
+                embed = discord.Embed(title="📥 멤버 가입", description=f"{member.mention} 님이 입장하셨습니다.", color=discord.Color.green(), timestamp=datetime.now(KST))
+                avatar_url = member.display_avatar.url if hasattr(member, 'display_avatar') else None
+                if avatar_url:
+                    embed.set_thumbnail(url=avatar_url)
+                embed.add_field(name="🔄 방문 횟수", value=f"총 {join_count}번째 입장", inline=False)
+                await ch.send(embed=embed)
+    except Exception as e:
+        logger.error(f"on_member_join error: {e}")
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    DB.execute("""
-        INSERT INTO leaved_members (guild_id, user_id, user_name) VALUES (?, ?, ?)
-        ON CONFLICT (guild_id, user_id) DO UPDATE SET user_name = excluded.user_name
-    """, member.guild.id, member.id, member.name)
+    try:
+        DB.execute("""
+            INSERT INTO leaved_members (guild_id, user_id, user_name) VALUES (?, ?, ?)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET user_name = excluded.user_name
+        """, member.guild.id, member.id, member.name)
 
-    row_cnt = DB.fetchone("SELECT join_count FROM user_join_counts WHERE guild_id=? AND user_id=?", member.guild.id, member.id)
-    join_count = row_cnt["join_count"] if row_cnt else 1
+        row_cnt = DB.fetchone("SELECT join_count FROM user_join_counts WHERE guild_id=? AND user_id=?", member.guild.id, member.id)
+        join_count = row_cnt["join_count"] if row_cnt and "join_count" in row_cnt else 1
 
-    row = DB.fetchone("SELECT log_channel_id FROM guild_settings WHERE guild_id=?", member.guild.id)
-    if not row or not row["log_channel_id"]: return
-    ch = member.guild.get_channel(row["log_channel_id"])
-    if not ch: return
+        row = DB.fetchone("SELECT log_channel_id FROM guild_settings WHERE guild_id=?", member.guild.id)
+        if not row or not row.get("log_channel_id"): return
+        ch = member.guild.get_channel(row["log_channel_id"])
+        if not ch or not isinstance(ch, discord.TextChannel): return
 
-    embed = discord.Embed(title="👏 멤버 퇴장 (관리 패널)", description=f"{member.name} 님이 떠나셨습니다.", color=discord.Color.red(), timestamp=datetime.now(KST))
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="🔄 총 방문 횟수", value=f"총 {join_count}회 드나듦", inline=False)
+        embed = discord.Embed(title="👏 멤버 퇴장 (관리 패널)", description=f"{member.name} 님이 떠나셨습니다.", color=discord.Color.red(), timestamp=datetime.now(KST))
+        avatar_url = member.display_avatar.url if hasattr(member, 'display_avatar') else None
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
+        embed.add_field(name="🔄 총 방문 횟수", value=f"총 {join_count}회 드나듦", inline=False)
 
-    sent = await ch.send(embed=embed, view=LogAdminActionView(member.id))
-    DB.execute(
-        "INSERT INTO mod_action_targets (message_id, guild_id, target_user_id, created_at) VALUES (?,?,?,?) "
-        "ON CONFLICT (message_id) DO UPDATE SET target_user_id=excluded.target_user_id",
-        sent.id, member.guild.id, member.id, now_kst_str()
-    )
+        sent = await ch.send(embed=embed, view=LogAdminActionView(member.id))
+        DB.execute(
+            "INSERT INTO mod_action_targets (message_id, guild_id, target_user_id, created_at) VALUES (?,?,?,?) "
+            "ON CONFLICT (message_id) DO UPDATE SET target_user_id=excluded.target_user_id",
+            sent.id, member.guild.id, member.id, now_kst_str()
+        )
+    except Exception as e:
+        logger.error(f"on_member_remove error: {e}")
 
 # ==============================================================================
 # 7. FastAPI 웹 서버 라우터 및 Lifespan 통합
 # ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not TOKEN:
+        logger.error("DISCORD_TOKEN is not set.")
     bot_task = asyncio.create_task(bot.start(TOKEN))
     yield
-    await bot.close()
-    await bot_task
+    try:
+        await bot.close()
+    except Exception:
+        pass
+    try:
+        await bot_task
+    except Exception:
+        pass
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "Auth Server Running with Local SQLite"}
+    return {"status": "Auth Server Running with Local SQLite (Stability Enhanced)"}
 
 @app.get("/login")
 def login(guild_id: str = None):
@@ -1099,7 +1278,7 @@ def login(guild_id: str = None):
 
 @app.get("/auth/callback", response_class=HTMLResponse)
 async def callback(code: str, state: str = None):
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             token_resp = await client.post(
                 "https://discord.com/api/oauth2/token",
@@ -1113,6 +1292,7 @@ async def callback(code: str, state: str = None):
             )
             token_data = token_resp.json()
         except Exception as e:
+            logger.error(f"OAuth2 token exchange error: {e}")
             token_data = {}
 
         if "access_token" not in token_data:
@@ -1133,7 +1313,8 @@ async def callback(code: str, state: str = None):
                 headers={"Authorization": f"Bearer {access_token}"}
             )
             user_data = user_resp.json()
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to fetch user data: {e}")
             user_data = {}
 
         user_id = user_data.get("id")
@@ -1184,7 +1365,7 @@ async def callback(code: str, state: str = None):
                     
                     if guild:
                         settings = DB.fetchone("SELECT verify_role_id FROM guild_settings WHERE guild_id = ?", guild_id_int)
-                        role_id = settings["verify_role_id"] if settings else None
+                        role_id = settings.get("verify_role_id") if settings else None
                         if role_id:
                             role = guild.get_role(role_id)
                             member = guild.get_member(int(user_id))
@@ -1196,26 +1377,26 @@ async def callback(code: str, state: str = None):
                             if member and role:
                                 try:
                                     await member.add_roles(role, reason="웹 연동 인증 완료 자동 역할 부여")
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.error(f"Failed to add verify role: {e}")
 
-                # 인증 로그 전송 (정리된 단일 인증 로그 채널 사용)
+                # 인증 로그 전송
                 targets_verify = []
                 with DB.get_connection() as conn:
                     cur = conn.cursor()
                     if guild_id_int is not None:
                         cur.execute("SELECT verify_log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id_int,))
                         row_res = cur.fetchone()
-                        if row_res and row_res["verify_log_channel_id"]:
+                        if row_res and row_res.get("verify_log_channel_id"):
                             targets_verify.append(row_res["verify_log_channel_id"])
                     else:
                         cur.execute("SELECT verify_log_channel_id FROM guild_settings")
                         for r_row in cur.fetchall():
-                            if r_row["verify_log_channel_id"]:
+                            if r_row.get("verify_log_channel_id"):
                                 targets_verify.append(r_row["verify_log_channel_id"])
 
                 if TOKEN:
-                    async with httpx.AsyncClient() as log_client:
+                    async with httpx.AsyncClient(timeout=10.0) as log_client:
                         for ch_id in targets_verify:
                             embed_payload = {
                                 "embeds": [{
@@ -1227,13 +1408,16 @@ async def callback(code: str, state: str = None):
                                     "timestamp": datetime.now(timezone.utc).isoformat()
                                 }]
                             }
-                            await log_client.post(
-                                f"https://discord.com/api/v10/channels/{ch_id}/messages",
-                                headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
-                                json=embed_payload
-                            )
+                            try:
+                                await log_client.post(
+                                    f"https://discord.com/api/v10/channels/{ch_id}/messages",
+                                    headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
+                                    json=embed_payload
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to send verify log message: {e}")
             except Exception as e:
-                print(f"❌ DB 연동 또는 로그 전송 오류: {e}")
+                logger.error(f"❌ DB 연동 또는 로그 전송 오류: {e}")
 
     html_content = f"""
     <!DOCTYPE html>
