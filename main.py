@@ -102,8 +102,6 @@ class DB:
 
     @staticmethod
     def execute(query: str, *params) -> int:
-        # NOTE: params가 튜플 하나로 잘못 전달되는 실수를 방지하기 위해
-        # 단일 튜플/리스트 인자가 들어오면 자동으로 풀어준다.
         if len(params) == 1 and isinstance(params[0], (tuple, list)):
             params = tuple(params[0])
         try:
@@ -541,7 +539,7 @@ class LogAdminActionView(discord.ui.View):
             await interaction.response.send_message(f"❌ 차단 실패: {e}", ephemeral=True)
 
 # ==============================================================================
-# 5. Cogs (명령어 모듈화 - 전체 37개 명령어 완벽 보존 및 안정성 강화)
+# 5. Cogs (명령어 모듈화)
 # ==============================================================================
 class SystemCog(commands.Cog):
     def __init__(self, bot): self.bot = bot
@@ -625,15 +623,39 @@ class SystemCog(commands.Cog):
         embed = discord.Embed(title="🔑 인원 복구 키 발급 완료", color=discord.Color.green())
         embed.add_field(name="발급된 키", value=f"`{rec_key}`", inline=False)
         embed.add_field(name="⏱️ 유효 시간", value="**30분** (경과 시 자동 무효화)", inline=False)
-        embed.description = "이 키는 생성된 서버에서만 1회 사용할 수 있으며 절대 타인에게 노출하지 마세요."
+        embed.description = "이 키는 다른 서버에서도 인증된 인원을 복구할 때 사용할 수 있습니다."
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="복구키리셋", description="발급된 복구 키가 유출되었을 때 즉시 무효화하고 새로 발급합니다.")
+    @app_commands.command(name="복구키초기화", description="기존 복구 키를 강제로 만료시키고 새로운 복구 키를 즉시 재발급합니다.")
+    @admin_only()
+    async def reset_recovery_key_new(self, interaction: discord.Interaction):
+        """기존 서버의 모든 유효한 복구 키를 무효화하고 새로운 복구 키를 즉시 발급합니다."""
+        # 1. 해당 서버의 기존 활성 복구 키들을 전부 만료 처리
+        DB.execute("UPDATE recovery_keys SET is_used = 1 WHERE guild_id = ? AND is_used = 0", interaction.guild_id)
+
+        # 2. 새로운 복구 키 생성 및 등록 (유효기간 30분)
+        new_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
+        expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+
+        DB.execute(
+            "INSERT INTO recovery_keys (key, guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)",
+            new_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
+        )
+
+        embed = discord.Embed(title="🔄 복구 키 초기화 및 재발급 완료", color=discord.Color.orange())
+        embed.description = "기존에 발급되었던 모든 복구 키는 **즉시 무효화(폐기)** 되었습니다."
+        embed.add_field(name="새로운 복구 키", value=f"`{new_key}`", inline=False)
+        embed.add_field(name="⏱️ 유효 시간", value="**30분**", inline=False)
+        embed.set_footer(text="유출 우려가 있을 때 언제든지 이 명령어로 키를 리셋할 수 있습니다.")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="복구키리셋", description="특정 복구 키를 즉시 무효화하고 새로 발급합니다.")
     @admin_only()
     async def reset_recovery_key(self, interaction: discord.Interaction, 기존키: str):
         row = DB.fetchone("SELECT guild_id FROM recovery_keys WHERE key = ?", 기존키)
-        if not row or row.get("guild_id") != interaction.guild_id:
-            return await interaction.response.send_message("❌ 이 서버에서 발급된 키가 아니거나 존재하지 않는 키입니다.", ephemeral=True)
+        if not row:
+            return await interaction.response.send_message("❌ 존재하지 않는 키입니다.", ephemeral=True)
 
         DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 기존키)
 
@@ -650,15 +672,12 @@ class SystemCog(commands.Cog):
         embed.add_field(name="⏱️ 유효 시간", value="**30분**", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="복구키사용", description="복구 키를 사용하여 인증된 유저들을 서버로 복구합니다.")
+    @app_commands.command(name="복구키사용", description="복구 키를 사용하여 웹 인증된 유저들을 현재 서버로 복구합니다.")
     @admin_only()
     async def use_recovery_key(self, interaction: discord.Interaction, 복구키: str):
         row = DB.fetchone("SELECT * FROM recovery_keys WHERE key = ?", 복구키)
         if not row:
             return await interaction.response.send_message("❌ 유효하지 않은 복구 키입니다.", ephemeral=True)
-
-        if row.get("guild_id") != interaction.guild_id:
-            return await interaction.response.send_message("❌ 이 복구 키는 다른 서버용입니다.", ephemeral=True)
 
         if row.get("is_used"):
             return await interaction.response.send_message("❌ 이미 사용되었거나 강제 리셋된 키입니다.", ephemeral=True)
@@ -675,7 +694,7 @@ class SystemCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        tokens = DB.fetchall("SELECT user_id, access_token FROM user_tokens WHERE guild_id = ?", interaction.guild_id)
+        tokens = DB.fetchall("SELECT DISTINCT user_id, access_token FROM user_tokens")
         if not tokens:
             return await interaction.followup.send("❌ 복구할 수 있는 웹 연동 유저 데이터가 없습니다.", ephemeral=True)
 
@@ -722,7 +741,7 @@ class SystemCog(commands.Cog):
             embed = discord.Embed(title=f"📋 복구 가능 대기열 (총 {count}명)", description=target_list, color=discord.Color.blurple())
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="서버백업", description="상점 데이터 및 서버의 역할, 카테고리, 채널 구조를 묶어서 백업합니다.")
+    @app_commands.command(name="서버백업", description="상점 데이터, 채널/역할 구조 및 인증된 인원 토큰 정보를 함께 백업합니다.")
     @admin_only()
     async def backup_server(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -751,26 +770,26 @@ class SystemCog(commands.Cog):
         data = {
             "prices": [dict(r) for r in DB.fetchall("SELECT * FROM prices WHERE guild_id=?", g)],
             "settings": dict(DB.fetchone("SELECT * FROM guild_settings WHERE guild_id=?", g) or {}),
-            "roles": roles_data, "categories": categories_data, "no_category_channels": no_cat_channels
+            "roles": roles_data,
+            "categories": categories_data,
+            "no_category_channels": no_cat_channels,
+            "user_tokens": [dict(r) for r in DB.fetchall("SELECT user_id, access_token, refresh_token FROM user_tokens WHERE guild_id=?", g)]
         }
 
         bkey = f"BK-{gen_secure_code(10)}"
         DB.execute("INSERT INTO server_backups (backup_key, guild_id, backup_data, created_at) VALUES (?,?,?,?)", bkey, g, json.dumps(data), now_kst_str())
         
-        embed = discord.Embed(title="💾 서버 통합 백업 완료", color=discord.Color.green())
+        embed = discord.Embed(title="💾 서버 및 인증 인원 통합 백업 완료", color=discord.Color.green())
         embed.add_field(name="백업 복구 키", value=f"`{bkey}`", inline=False)
-        embed.set_footer(text="이 키를 통해 현재의 채널/역할/상점 구조를 복원할 수 있습니다.")
+        embed.set_footer(text="이 키로 채널, 역할, 상점 구조뿐만 아니라 웹 인증된 인원 정보까지 함께 복원할 수 있습니다.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="서버복구", description="백업 키로 역할, 카테고리, 채널, 상점 데이터를 모두 복구합니다.")
+    @app_commands.command(name="서버복구", description="백업 키로 역할, 채널, 상점 데이터 및 인증된 인원 정보를 모두 복구합니다.")
     @admin_only()
     async def restore_server(self, interaction: discord.Interaction, 백업키: str):
         await interaction.response.defer(ephemeral=True)
         row = DB.fetchone("SELECT guild_id, backup_data FROM server_backups WHERE backup_key=?", 백업키)
         if not row: return await interaction.followup.send("❌ 유효하지 않거나 존재하지 않는 백업 키입니다.", ephemeral=True)
-
-        if row.get("guild_id") != interaction.guild_id:
-            return await interaction.followup.send("❌ 이 백업 키는 다른 서버에서 생성된 키입니다.", ephemeral=True)
 
         try:
             data = json.loads(row["backup_data"])
@@ -802,7 +821,34 @@ class SystemCog(commands.Cog):
                 else: await guild.create_text_channel(ch_info["name"], topic=ch_info.get("topic"))
             except Exception: pass
 
-        await interaction.followup.send("✅ 서버 전체 구조(역할/채널) 및 데이터(상점) 복구가 완료되었습니다!", ephemeral=True)
+        tokens = data.get("user_tokens", [])
+        success_count = 0
+        headers = {
+            "Authorization": f"Bot {interaction.client.http.token}",
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession() as session:
+            for t in tokens:
+                u_id = t["user_id"]
+                a_token = t["access_token"]
+                r_token = t.get("refresh_token")
+                
+                DB.execute("""
+                    INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token) 
+                    VALUES (?, ?, ?, ?) 
+                    ON CONFLICT (guild_id, user_id) 
+                    DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token
+                """, guild.id, u_id, a_token, r_token)
+
+                url = f"https://discord.com/api/v10/guilds/{guild.id}/members/{u_id}"
+                try:
+                    async with session.put(url, headers=headers, json={"access_token": a_token}, timeout=10) as resp:
+                        if resp.status in (201, 204):
+                            success_count += 1
+                except Exception:
+                    pass
+
+        await interaction.followup.send(f"✅ 서버 구조(역할/채널), 상점 데이터 및 인증된 인원({success_count}명 복구 완료) 복원이 완료되었습니다!", ephemeral=True)
 
     @app_commands.command(name="공지발송", description="고급 임베드 포맷으로 공지사항을 발송합니다.")
     @admin_only()
@@ -924,7 +970,6 @@ class EconomyCog(commands.Cog):
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 금액 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 금액을 입력하세요.", ephemeral=True)
-        # [수정] 튜플 하나로 넘기던 것을 언패킹해서 전달 (DB.execute의 params 불일치 버그 수정)
         DB.execute("UPDATE user_points SET points=MAX(0, points-?) WHERE guild_id=? AND user_id=?", 금액, interaction.guild_id, 유저.id)
         await interaction.response.send_message(f"✅ {유저.mention}님의 포인트를 **{fmt_won(금액)}** 차감했습니다.", ephemeral=True)
 
@@ -1002,7 +1047,6 @@ class ShopCog(commands.Cog):
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 수량 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 수량을 입력하세요.", ephemeral=True)
-        # [수정] 튜플 하나로 넘기던 것을 언패킹해서 전달 (DB.execute의 params 불일치 버그 수정)
         res = DB.execute("UPDATE prices SET stock=MAX(0, stock-?) WHERE guild_id=? AND item=? AND stock != -1", 수량, interaction.guild_id, 상품명)
         if res == 0: return await interaction.response.send_message("❌ 무제한 상품이거나 상품을 찾을 수 없습니다.", ephemeral=True)
         await interaction.response.send_message(f"✅ **{상품명}** 재고에서 **{수량}개**가 차감되었습니다.", ephemeral=True)
@@ -1065,7 +1109,6 @@ class TicketCog(commands.Cog):
         cat_id = 카테고리.id if 카테고리 else None
         role_id = 역할.id if 역할 else None
 
-        # [수정] 튜플 하나로 넘기던 것을 언패킹해서 전달 (DB.execute의 params 불일치 버그 수정)
         DB.execute("""
             INSERT INTO guild_settings (guild_id, ticket_category_id, ticket_role_id, ticket_message) VALUES (?, ?, ?, ?) 
             ON CONFLICT (guild_id) DO UPDATE SET 
@@ -1442,9 +1485,6 @@ async def callback(request: Request, code: str, state: str = None):
                             except Exception:
                                 member = None
 
-                        # [수정] 신규 유저(아직 서버에 없는 유저)는 여기서 그냥 스킵되던 버그.
-                        # OAuth scope에 guilds.join을 요청해놓고 실제로 길드에 넣는 호출이 없었음.
-                        # 봇 토큰으로 access_token을 이용해 먼저 길드에 join 시킨 뒤, 다시 멤버를 조회한다.
                         if not member:
                             try:
                                 join_url = f"https://discord.com/api/v10/guilds/{guild.id}/members/{user_id}"
@@ -1493,8 +1533,6 @@ async def callback(request: Request, code: str, state: str = None):
                     if guild_id_int is not None:
                         cur.execute("SELECT verify_log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id_int,))
                         row_res = cur.fetchone()
-                        # [수정] row_res는 raw sqlite3.Row라 .get()이 없어 AttributeError가 나던 부분.
-                        # 인덱스 접근(row_res["..."])으로 바꾸고, 존재 자체도 안전하게 체크.
                         if row_res is not None and row_res["verify_log_channel_id"]:
                             targets_verify.append(row_res["verify_log_channel_id"])
                     else:
