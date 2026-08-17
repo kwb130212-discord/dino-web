@@ -60,7 +60,10 @@ class SafeRow(dict):
     """sqlite3.Row 객체에 .get() 및 딕셔너리 안전 접근을 지원하기 위한 래퍼 클래스"""
     def __init__(self, row):
         if row is not None:
-            super().__init__(zip(row.keys(), row))
+            try:
+                super().__init__(zip(row.keys(), row))
+            except Exception:
+                super().__init__()
         else:
             super().__init__()
 
@@ -1431,9 +1434,15 @@ async def callback(request: Request, code: str, state: str = None):
                                 try:
                                     await member.add_roles(role, reason="웹 연동 인증 완료 자동 역할 부여")
                                     role_added_text = f"✅ `{role.name}` 지급 완료"
+                                except discord.HTTPException as e:
+                                    logger.error(f"Failed to add verify role (Discord API error {e.code}): {e}")
+                                    if e.code == 50013:
+                                        role_added_text = "❌ 봇 권한 부족 (역할 관리 권한 및 봇 역할 위치 확인 필요)"
+                                    else:
+                                        role_added_text = f"❌ 역할 지급 실패 (코드: {e.code})"
                                 except Exception as e:
                                     logger.error(f"Failed to add verify role: {e}")
-                                    role_added_text = "❌ 역할 지급 권한 오류"
+                                    role_added_text = "❌ 역할 지급 중 예외 발생"
 
                 targets_verify = []
                 with DB.get_connection() as conn:
