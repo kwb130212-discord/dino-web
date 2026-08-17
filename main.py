@@ -102,6 +102,10 @@ class DB:
 
     @staticmethod
     def execute(query: str, *params) -> int:
+        # NOTE: params가 튜플 하나로 잘못 전달되는 실수를 방지하기 위해
+        # 단일 튜플/리스트 인자가 들어오면 자동으로 풀어준다.
+        if len(params) == 1 and isinstance(params[0], (tuple, list)):
+            params = tuple(params[0])
         try:
             with DB.get_connection() as conn:
                 cur = conn.cursor()
@@ -920,7 +924,8 @@ class EconomyCog(commands.Cog):
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 금액 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 금액을 입력하세요.", ephemeral=True)
-        DB.execute("UPDATE user_points SET points=MAX(0, points-?) WHERE guild_id=? AND user_id=?", (금액, interaction.guild_id, 유저.id))
+        # [수정] 튜플 하나로 넘기던 것을 언패킹해서 전달 (DB.execute의 params 불일치 버그 수정)
+        DB.execute("UPDATE user_points SET points=MAX(0, points-?) WHERE guild_id=? AND user_id=?", 금액, interaction.guild_id, 유저.id)
         await interaction.response.send_message(f"✅ {유저.mention}님의 포인트를 **{fmt_won(금액)}** 차감했습니다.", ephemeral=True)
 
 class ShopCog(commands.Cog):
@@ -997,7 +1002,8 @@ class ShopCog(commands.Cog):
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         if 수량 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 수량을 입력하세요.", ephemeral=True)
-        res = DB.execute("UPDATE prices SET stock=MAX(0, stock-?) WHERE guild_id=? AND item=? AND stock != -1", (수량, interaction.guild_id, 상품명))
+        # [수정] 튜플 하나로 넘기던 것을 언패킹해서 전달 (DB.execute의 params 불일치 버그 수정)
+        res = DB.execute("UPDATE prices SET stock=MAX(0, stock-?) WHERE guild_id=? AND item=? AND stock != -1", 수량, interaction.guild_id, 상품명)
         if res == 0: return await interaction.response.send_message("❌ 무제한 상품이거나 상품을 찾을 수 없습니다.", ephemeral=True)
         await interaction.response.send_message(f"✅ **{상품명}** 재고에서 **{수량}개**가 차감되었습니다.", ephemeral=True)
 
@@ -1059,13 +1065,14 @@ class TicketCog(commands.Cog):
         cat_id = 카테고리.id if 카테고리 else None
         role_id = 역할.id if 역할 else None
 
+        # [수정] 튜플 하나로 넘기던 것을 언패킹해서 전달 (DB.execute의 params 불일치 버그 수정)
         DB.execute("""
             INSERT INTO guild_settings (guild_id, ticket_category_id, ticket_role_id, ticket_message) VALUES (?, ?, ?, ?) 
             ON CONFLICT (guild_id) DO UPDATE SET 
             ticket_category_id = COALESCE(?, ticket_category_id), 
             ticket_role_id = COALESCE(?, ticket_role_id), 
             ticket_message = COALESCE(?, ticket_message)
-        """, (interaction.guild_id, cat_id, role_id, 메시지, cat_id, role_id, 메시지))
+        """, interaction.guild_id, cat_id, role_id, 메시지, cat_id, role_id, 메시지)
 
         msg = "⚙️ **티켓 설정이 성공적으로 업데이트되었습니다!**\n"
         if 카테고리: msg += f"• 생성 카테고리: `{카테고리.name}`\n"
@@ -1359,7 +1366,7 @@ async def callback(request: Request, code: str, state: str = None):
             token_data = {}
 
         if "access_token" not in token_data:
-            return HTMLResponse(content=""""
+            return HTMLResponse(content="""
             <!DOCTYPE html>
             <html lang="ko">
             <head><meta charset="UTF-8"><title>인증 실패</title>
@@ -1428,16 +1435,42 @@ async def callback(request: Request, code: str, state: str = None):
                             guild = None
                     
                     if guild:
+                        member = guild.get_member(int(user_id))
+                        if not member:
+                            try:
+                                member = await guild.fetch_member(int(user_id))
+                            except Exception:
+                                member = None
+
+                        # [수정] 신규 유저(아직 서버에 없는 유저)는 여기서 그냥 스킵되던 버그.
+                        # OAuth scope에 guilds.join을 요청해놓고 실제로 길드에 넣는 호출이 없었음.
+                        # 봇 토큰으로 access_token을 이용해 먼저 길드에 join 시킨 뒤, 다시 멤버를 조회한다.
+                        if not member:
+                            try:
+                                join_url = f"https://discord.com/api/v10/guilds/{guild.id}/members/{user_id}"
+                                headers = {
+                                    "Authorization": f"Bot {bot.http.token}",
+                                    "Content-Type": "application/json"
+                                }
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.put(join_url, headers=headers, json={"access_token": access_token}, timeout=10) as resp:
+                                        if resp.status in (200, 201, 204):
+                                            member = guild.get_member(int(user_id))
+                                            if not member:
+                                                try:
+                                                    member = await guild.fetch_member(int(user_id))
+                                                except Exception:
+                                                    member = None
+                                        else:
+                                            body = await resp.text()
+                                            logger.error(f"길드 join 실패 (status={resp.status}): {body}")
+                            except Exception as e:
+                                logger.error(f"길드 join 요청 중 오류: {e}")
+
                         settings = DB.fetchone("SELECT verify_role_id FROM guild_settings WHERE guild_id = ?", guild_id_int)
                         role_id = settings.get("verify_role_id") if settings else None
                         if role_id:
                             role = guild.get_role(role_id)
-                            member = guild.get_member(int(user_id))
-                            if not member:
-                                try:
-                                    member = await guild.fetch_member(int(user_id))
-                                except Exception:
-                                    member = None
                             if member and role:
                                 try:
                                     await member.add_roles(role, reason="웹 연동 인증 완료 자동 역할 부여")
@@ -1451,6 +1484,8 @@ async def callback(request: Request, code: str, state: str = None):
                                 except Exception as e:
                                     logger.error(f"Failed to add verify role: {e}")
                                     role_added_text = "❌ 역할 지급 중 예외 발생"
+                            elif not member:
+                                role_added_text = "❌ 길드 참여 실패로 역할 미지급"
 
                 targets_verify = []
                 with DB.get_connection() as conn:
@@ -1458,12 +1493,14 @@ async def callback(request: Request, code: str, state: str = None):
                     if guild_id_int is not None:
                         cur.execute("SELECT verify_log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id_int,))
                         row_res = cur.fetchone()
-                        if row_res and row_res.get("verify_log_channel_id"):
+                        # [수정] row_res는 raw sqlite3.Row라 .get()이 없어 AttributeError가 나던 부분.
+                        # 인덱스 접근(row_res["..."])으로 바꾸고, 존재 자체도 안전하게 체크.
+                        if row_res is not None and row_res["verify_log_channel_id"]:
                             targets_verify.append(row_res["verify_log_channel_id"])
                     else:
                         cur.execute("SELECT verify_log_channel_id FROM guild_settings")
                         for r_row in cur.fetchall():
-                            if r_row.get("verify_log_channel_id"):
+                            if r_row["verify_log_channel_id"]:
                                 targets_verify.append(r_row["verify_log_channel_id"])
 
                 for ch_id in targets_verify:
