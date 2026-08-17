@@ -629,11 +629,8 @@ class SystemCog(commands.Cog):
     @app_commands.command(name="복구키초기화", description="기존 복구 키를 강제로 만료시키고 새로운 복구 키를 즉시 재발급합니다.")
     @admin_only()
     async def reset_recovery_key_new(self, interaction: discord.Interaction):
-        """기존 서버의 모든 유효한 복구 키를 무효화하고 새로운 복구 키를 즉시 발급합니다."""
-        # 1. 해당 서버의 기존 활성 복구 키들을 전부 만료 처리
         DB.execute("UPDATE recovery_keys SET is_used = 1 WHERE guild_id = ? AND is_used = 0", interaction.guild_id)
 
-        # 2. 새로운 복구 키 생성 및 등록 (유효기간 30분)
         new_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
 
