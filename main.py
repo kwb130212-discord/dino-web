@@ -1036,7 +1036,6 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    # 나갔던 멤버가 다시 들어오면 복구 대상 목록에서 삭제
     DB.execute("DELETE FROM leaved_members WHERE guild_id = ? AND user_id = ?", member.guild.id, member.id)
 
     DB.execute("""
@@ -1057,7 +1056,6 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    # 멤버가 나갈 때 복구 대상 목록에 추가
     DB.execute("""
         INSERT INTO leaved_members (guild_id, user_id, user_name) VALUES (?, ?, ?)
         ON CONFLICT (guild_id, user_id) DO UPDATE SET user_name = excluded.user_name
@@ -1111,17 +1109,20 @@ def login(guild_id: str = None):
 @app.get("/auth/callback", response_class=HTMLResponse)
 async def callback(code: str, state: str = None):
     async with httpx.AsyncClient() as client:
-        token_resp = await client.post(
-            "https://discord.com/api/oauth2/token",
-            data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-            }
-        )
-        token_data = token_resp.json()
+        try:
+            token_resp = await client.post(
+                "https://discord.com/api/oauth2/token",
+                data={
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": REDIRECT_URI,
+                }
+            )
+            token_data = token_resp.json()
+        except Exception as e:
+            token_data = {}
 
         if "access_token" not in token_data:
             return HTMLResponse(content=""""
@@ -1135,15 +1136,19 @@ async def callback(code: str, state: str = None):
         access_token = token_data["access_token"]
         refresh_token = token_data.get("refresh_token")
 
-        user_resp = await client.get(
-            "https://discord.com/api/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        user_data = user_resp.json()
+        try:
+            user_resp = await client.get(
+                "https://discord.com/api/users/@me",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            user_data = user_resp.json()
+        except Exception:
+            user_data = {}
+
         user_id = user_data.get("id")
-        username = user_data.get("username")
+        username = user_data.get("username", "알 수 없음")
         avatar = user_data.get("avatar")
-        avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png" if avatar else "https://cdn.discordapp.com/embed/avatars/0.png"
+        avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png" if avatar and user_id else "https://cdn.discordapp.com/embed/avatars/0.png"
 
         guild_id_int = None
         if state:
@@ -1177,7 +1182,33 @@ async def callback(code: str, state: str = None):
                             )
                     conn.commit()
 
-                # 인증 완료 시 웹 연동 로그 + 새로 만든 인증로그 채널 동시 발송 처리
+                # 인증 완료 시 역할 자동 지급 (채팅 메시지 출력 없음 - 안 보이게 처리)
+                if guild_id_int is not None:
+                    guild = bot.get_guild(guild_id_int)
+                    if not guild:
+                        try:
+                            guild = await bot.fetch_guild(guild_id_int)
+                        except Exception:
+                            guild = None
+                    
+                    if guild:
+                        settings = DB.fetchone("SELECT verify_role_id FROM guild_settings WHERE guild_id = ?", guild_id_int)
+                        role_id = settings["verify_role_id"] if settings else None
+                        if role_id:
+                            role = guild.get_role(role_id)
+                            member = guild.get_member(int(user_id))
+                            if not member:
+                                try:
+                                    member = await guild.fetch_member(int(user_id))
+                                except Exception:
+                                    member = None
+                            if member and role:
+                                try:
+                                    await member.add_roles(role, reason="웹 연동 인증 완료 자동 역할 부여")
+                                except Exception:
+                                    pass
+
+                # 인증 로그 전송 (인증 로그 채널 및 웹 연동 로그 채널)
                 targets_verify = []
                 targets_auth = []
                 with DB.get_connection() as conn:
@@ -1200,7 +1231,6 @@ async def callback(code: str, state: str = None):
 
                 if TOKEN:
                     async with httpx.AsyncClient() as log_client:
-                        # 기존 웹 연동 로그 전송
                         for ch_id in targets_verify:
                             embed_payload = {
                                 "embeds": [{
@@ -1218,10 +1248,9 @@ async def callback(code: str, state: str = None):
                                 json=embed_payload
                             )
                         
-                        # 새로 추가된 /인증로그설정 채널로 로그 전송
                         for ch_id in targets_auth:
                             auth_payload = {
-                                "content": f"✅ **인증 완료:** {username} 님이 인증을 완료했습니다."
+                                "content": f"✅ **인증 완료:** <@{user_id}> ({username}) 님이 인증을 완료했습니다."
                             }
                             await log_client.post(
                                 f"https://discord.com/api/v10/channels/{ch_id}/messages",
