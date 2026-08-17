@@ -113,7 +113,7 @@ class DB:
                 license_key TEXT PRIMARY KEY, duration_days INTEGER NOT NULL, is_used INTEGER DEFAULT 0, used_by_guild INTEGER, used_at TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id INTEGER PRIMARY KEY, receipt_channel_id INTEGER, welcome_channel_id INTEGER, log_channel_id INTEGER, verify_role_id INTEGER, ticket_category_id INTEGER, ticket_role_id INTEGER, ticket_message TEXT, verify_log_channel_id INTEGER, auth_log_channel_id INTEGER
+                guild_id INTEGER PRIMARY KEY, receipt_channel_id INTEGER, welcome_channel_id INTEGER, log_channel_id INTEGER, verify_role_id INTEGER, ticket_category_id INTEGER, ticket_role_id INTEGER, ticket_message TEXT, verify_log_channel_id INTEGER
             )""",
             """CREATE TABLE IF NOT EXISTS bot_admins (
                 guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, added_by INTEGER NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (guild_id, user_id)
@@ -942,15 +942,6 @@ class AdminSetupCog(commands.Cog):
         """, interaction.guild_id, 채널.id)
         await interaction.response.send_message(f"✅ 인증 로그 채널 설정: {채널.mention}", ephemeral=True)
 
-    @app_commands.command(name="인증로그설정", description="인증 완료 로그가 전송될 채널을 설정합니다.")
-    @admin_only()
-    async def set_auth_log_channel(self, interaction: discord.Interaction, 채널: discord.TextChannel):
-        DB.execute("""
-            INSERT INTO guild_settings (guild_id, auth_log_channel_id) VALUES (?,?) 
-            ON CONFLICT (guild_id) DO UPDATE SET auth_log_channel_id=excluded.auth_log_channel_id
-        """, interaction.guild_id, 채널.id)
-        await interaction.response.send_message(f"✅ 인증 로그 채널이 {채널.mention}으로 설정되었습니다.", ephemeral=True)
-
     @app_commands.command(name="인증역할설정", description="인증 완료 시 줄 역할")
     @admin_only()
     async def set_vrole(self, interaction: discord.Interaction, 역할: discord.Role):
@@ -1182,7 +1173,7 @@ async def callback(code: str, state: str = None):
                             )
                     conn.commit()
 
-                # 인증 완료 시 역할 자동 지급 (채팅 메시지 출력 없음 - 안 보이게 처리)
+                # 인증 완료 시 역할 자동 지급
                 if guild_id_int is not None:
                     guild = bot.get_guild(guild_id_int)
                     if not guild:
@@ -1208,26 +1199,20 @@ async def callback(code: str, state: str = None):
                                 except Exception:
                                     pass
 
-                # 인증 로그 전송 (인증 로그 채널 및 웹 연동 로그 채널)
+                # 인증 로그 전송 (정리된 단일 인증 로그 채널 사용)
                 targets_verify = []
-                targets_auth = []
                 with DB.get_connection() as conn:
                     cur = conn.cursor()
                     if guild_id_int is not None:
-                        cur.execute("SELECT verify_log_channel_id, auth_log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id_int,))
+                        cur.execute("SELECT verify_log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id_int,))
                         row_res = cur.fetchone()
-                        if row_res:
-                            if row_res["verify_log_channel_id"]:
-                                targets_verify.append(row_res["verify_log_channel_id"])
-                            if row_res["auth_log_channel_id"]:
-                                targets_auth.append(row_res["auth_log_channel_id"])
+                        if row_res and row_res["verify_log_channel_id"]:
+                            targets_verify.append(row_res["verify_log_channel_id"])
                     else:
-                        cur.execute("SELECT verify_log_channel_id, auth_log_channel_id FROM guild_settings")
+                        cur.execute("SELECT verify_log_channel_id FROM guild_settings")
                         for r_row in cur.fetchall():
                             if r_row["verify_log_channel_id"]:
                                 targets_verify.append(r_row["verify_log_channel_id"])
-                            if r_row["auth_log_channel_id"]:
-                                targets_auth.append(r_row["auth_log_channel_id"])
 
                 if TOKEN:
                     async with httpx.AsyncClient() as log_client:
@@ -1246,16 +1231,6 @@ async def callback(code: str, state: str = None):
                                 f"https://discord.com/api/v10/channels/{ch_id}/messages",
                                 headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
                                 json=embed_payload
-                            )
-                        
-                        for ch_id in targets_auth:
-                            auth_payload = {
-                                "content": f"✅ **인증 완료:** <@{user_id}> ({username}) 님이 인증을 완료했습니다."
-                            }
-                            await log_client.post(
-                                f"https://discord.com/api/v10/channels/{ch_id}/messages",
-                                headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
-                                json=auth_payload
                             )
             except Exception as e:
                 print(f"❌ DB 연동 또는 로그 전송 오류: {e}")
@@ -1287,7 +1262,7 @@ async def callback(code: str, state: str = None):
                 border-radius: 24px;
                 text-align: center;
                 box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
-                width: 360px;
+                width: 380px;
                 animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1);
             }}
             @keyframes fadeIn {{
@@ -1332,7 +1307,27 @@ async def callback(code: str, state: str = None):
                 color: #94a3b8;
                 font-size: 14px;
                 line-height: 1.6;
-                margin: 0 0 30px 0;
+                margin: 0 0 20px 0;
+            }}
+            .checkbox-group {{
+                display: flex;
+                align-items: center;
+                justify-content: flex-start;
+                background: rgba(15, 23, 42, 0.5);
+                padding: 12px 14px;
+                border-radius: 10px;
+                margin-bottom: 20px;
+                border: 1px solid rgba(255, 255, 255, 0.05);
+                font-size: 13px;
+                color: #cbd5e1;
+                text-align: left;
+            }}
+            .checkbox-group input[type="checkbox"] {{
+                width: 16px;
+                height: 16px;
+                accent-color: #38bdf8;
+                margin-right: 10px;
+                cursor: pointer;
             }}
             .btn {{
                 background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
@@ -1361,7 +1356,11 @@ async def callback(code: str, state: str = None):
             <img src="{avatar_url}" alt="프로필" class="profile-img">
             <div class="icon-badge">✓</div>
             <h2>인증이 완료되었습니다</h2>
-            <p><span class="username-highlight">{username}</span> 님의 계정 연동 및 인증이<br>성공적으로 처리되었습니다. 이제 창을 닫으셔도 됩니다.</p>
+            <p><span class="username-highlight">{username}</span> 님의 계정 연동 및 인증이<br>성공적으로 처리되었습니다.</p>
+            <div class="checkbox-group">
+                <input type="checkbox" id="termsCheck" checked disabled>
+                <label for="termsCheck">서버 이용약관 및 개인정보 처리방침 동의 완료</label>
+            </div>
             <button class="btn" onclick="window.close()">창 닫기</button>
         </div>
     </body>
