@@ -56,6 +56,14 @@ def gen_secure_code(n: int) -> str:
 # ==============================================================================
 # 2. 데이터베이스 매니저 (SQLite 로컬 파일 기반 + WAL 모드 안정성 강화)
 # ==============================================================================
+class SafeRow(dict):
+    """sqlite3.Row 객체에 .get() 및 딕셔너리 안전 접근을 지원하기 위한 래퍼 클래스"""
+    def __init__(self, row):
+        if row is not None:
+            super().__init__(zip(row.keys(), row))
+        else:
+            super().__init__()
+
 class DB:
     """SQLite 로컬 데이터베이스 연결을 위한 정적 매니저 클래스"""
     DB_NAME = "database.db"
@@ -73,7 +81,7 @@ class DB:
                 cur = conn.cursor()
                 cur.execute(query, params)
                 row = cur.fetchone()
-                return dict(row) if row else None
+                return SafeRow(row) if row else None
         except Exception as e:
             logger.error(f"DB fetchone error: {e} | Query: {query}")
             return None
@@ -84,7 +92,7 @@ class DB:
             with DB.get_connection() as conn:
                 cur = conn.cursor()
                 cur.execute(query, params)
-                return [dict(row) for row in cur.fetchall()]
+                return [SafeRow(row) for row in cur.fetchall()]
         except Exception as e:
             logger.error(f"DB fetchall error: {e} | Query: {query}")
             return []
@@ -312,7 +320,7 @@ class VerifyView(discord.ui.View):
             oauth_url += f"&state={guild_id}"
 
         self.add_item(discord.ui.Button(
-            label="디스코드 웹 연동 인증하기 🔓",
+            label="디스코드 웹 연동 인증하기 🔒",
             style=discord.ButtonStyle.link,
             url=oauth_url
         ))
