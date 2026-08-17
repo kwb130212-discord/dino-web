@@ -285,7 +285,6 @@ def seller_only():
         return True
     return app_commands.check(predicate)
 
-# [업그레이드] 상품 자동완성 함수
 async def item_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     items = DB.fetchall("SELECT item FROM prices WHERE guild_id = ?", interaction.guild_id)
     return [
@@ -575,7 +574,6 @@ class SystemCog(commands.Cog):
 
         await interaction.response.send_message(f"🎉 성공적으로 라이센스가 연장되었습니다!\n🗓️ **새 만료일:** {exp_str}", ephemeral=True)
 
-    # [업그레이드] 서버정보 명령어 기능 대폭 추가
     @app_commands.command(name="서버정보", description="서버 상태와 라이센스 및 상세 정보를 확인합니다.")
     async def server_info(self, interaction: discord.Interaction):
         if not interaction.guild_id or not interaction.guild:
@@ -704,7 +702,6 @@ class SystemCog(commands.Cog):
         else:
             count = len(targets)
             target_list = "\n".join([f"• {name['user_name']}" for name in targets if name.get("user_name")])
-            # 메시지 길이가 길어질 경우 대비
             if len(target_list) > 1800:
                 target_list = target_list[:1800] + "\n... (생략됨)"
             embed = discord.Embed(title=f"📋 복구 가능 대기열 (총 {count}명)", description=target_list, color=discord.Color.blurple())
@@ -1280,7 +1277,7 @@ async def on_member_remove(member: discord.Member):
         logger.error(f"on_member_remove error: {e}")
 
 # ==============================================================================
-# 7. FastAPI 웹 서버 라우터 및 Lifespan 통합
+# 7. FastAPI 웹 서버 라우터 및 Lifespan 통합 (웹 인증 안정성 최우선 강화)
 # ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1314,7 +1311,18 @@ def login(guild_id: str = None):
     return RedirectResponse(auth_url)
 
 @app.get("/auth/callback", response_class=HTMLResponse)
-async def callback(request: Request, code: str, state: str = None):
+async def callback(request: Request, code: Optional[str] = None, error: Optional[str] = None, state: Optional[str] = None):
+    # 사용자가 인증을 거부하거나(취소) 에러가 반환된 경우 처리
+    if error or not code:
+        err_msg = error or "인증 코드가 전달되지 않았습니다."
+        return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html lang="ko">
+        <head><meta charset="UTF-8"><title>인증 취소 또는 실패</title>
+        <style>body{{background:#0f172a;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}}.card{{background:#1e293b;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid #334155;}}</style>
+        </head><body><div class="card"><h2 style="color:#f87171;">⚠️ 인증이 취소되었습니다</h2><p>사유: {err_msg}<br>창을 닫고 디스코드에서 다시 시도해 주세요.</p></div></body></html>
+        """, status_code=200)
+
     # 프록시 환경 아이피 추출
     client_ip = "알 수 없음"
     try:
@@ -1404,7 +1412,6 @@ async def callback(request: Request, code: str, state: str = None):
                             )
                     conn.commit()
 
-                # 인증 완료 시 역할 자동 지급 (예외 처리 강화)
                 if guild_id_int is not None:
                     guild = bot.get_guild(guild_id_int)
                     if not guild:
@@ -1432,9 +1439,6 @@ async def callback(request: Request, code: str, state: str = None):
                                     logger.error(f"Failed to add verify role: {e}")
                                     role_added_text = "❌ 역할 지급 권한 오류"
 
-                # ==============================================================================
-                # [버그 수정 완료] 인증 로그 전송 로직 (discord.py 내부 채널 사용)
-                # ==============================================================================
                 targets_verify = []
                 with DB.get_connection() as conn:
                     cur = conn.cursor()
@@ -1449,7 +1453,6 @@ async def callback(request: Request, code: str, state: str = None):
                             if r_row.get("verify_log_channel_id"):
                                 targets_verify.append(r_row["verify_log_channel_id"])
 
-                # discord.py bot 객체를 이용해 안전하게 전송
                 for ch_id in targets_verify:
                     log_channel = bot.get_channel(ch_id)
                     if not log_channel:
@@ -1462,7 +1465,7 @@ async def callback(request: Request, code: str, state: str = None):
                         embed = discord.Embed(
                             title="🔓 웹 연동 인증 완료",
                             description=f"<@{user_id}> (`{username}`) 님이 웹 연동을 성공적으로 완료했습니다.",
-                            color=discord.Color.from_rgb(88, 101, 242), # 디스코드 블루
+                            color=discord.Color.from_rgb(88, 101, 242),
                             timestamp=datetime.now(KST)
                         )
                         embed.set_thumbnail(url=avatar_url)
