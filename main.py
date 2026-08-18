@@ -1088,7 +1088,7 @@ class ShopCog(commands.Cog):
         if 수량 <= 0:
             return await interaction.response.send_message("❌ 1 이상의 수량을 입력하세요.", ephemeral=True)
         res = DB.execute("UPDATE prices SET stock=stock+? WHERE guild_id=? AND item=? AND stock != -1", 수량, interaction.guild_id, 상품명)
-        if res == 0: return await interaction.response.send_message("❌ 무제한 상품이거나 상품을 찾을 수 없습니다.", ephemeral=True)
+        if res == 0: return await interaction.response.send_message("❌ 무제한 상품이거나 상품을 찾을 수 정 없습니다.", ephemeral=True)
         await interaction.response.send_message(f"✅ **{상품명}** 재고에 **{수량}개**가 추가되었습니다.", ephemeral=True)
 
     @app_commands.command(name="재고차감", description="기존 상품 재고에서 입력한 수량만큼 차감합니다.")
@@ -1247,40 +1247,25 @@ class AdminSetupCog(commands.Cog):
         """, interaction.guild_id, 역할.id)
         await interaction.response.send_message(f"✅ 인증 완료 시 지급될 자동 역할이 {역할.name} 역할로 설정되었습니다.", ephemeral=True)
 
-    @app_commands.command(name="인증메시지설정", description="사진과 같이 인증 패널의 버튼 텍스트와 설명 텍스트를 커스텀 설정하고 전송합니다.")
+    @app_commands.command(name="인증패널전송", description="인증 패널의 버튼 및 설명 텍스트를 설정한 후 채널에 전송합니다.")
     @admin_only()
-    async def set_verify_message_modal(self, interaction: discord.Interaction):
+    async def send_vpanel(self, interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        
+        # DB에서 기존 설정값을 불러와 모달의 텍스트 기본값으로 채워줍니다.
         row = DB.fetchone("SELECT verify_button_text, verify_description FROM guild_settings WHERE guild_id = ?", interaction.guild_id)
         modal = VerifySettingsModal()
+        
         if row:
             if row.get("verify_button_text"):
                 modal.button_text.default = row["verify_button_text"]
             if row.get("verify_description"):
                 modal.description_text.default = row["verify_description"]
+                
+        # 팝업(모달)을 띄워 사용자에게 텍스트 입력을 받습니다.
+        # 모달에서 '제출'을 누르면 VerifySettingsModal 내의 on_submit 기능이 작동하여 채널에 패널이 전송됩니다.
         await interaction.response.send_modal(modal)
-
-    @app_commands.command(name="인증패널전송", description="서버 유저가 웹 계정 연동 인증을 할 수 있는 버튼 UI를 설치합니다.")
-    @admin_only()
-    async def send_vpanel(self, interaction: discord.Interaction):
-        if not isinstance(interaction.channel, discord.TextChannel):
-            return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        
-        row = DB.fetchone("SELECT verify_button_text, verify_description FROM guild_settings WHERE guild_id = ?", interaction.guild_id)
-        btn_txt = row["verify_button_text"] if row and row.get("verify_button_text") else "인증하기"
-        desc_txt = row["verify_description"] if row and row.get("verify_description") else "복구키 판매에 **절대로** 사용하지 않으며 오직 서버 복구용입니다."
-
-        embed = discord.Embed(
-            title="🔒 디스코드 서버 계정 인증", 
-            description=desc_txt, 
-            color=discord.Color.green()
-        )
-        if interaction.guild.icon:
-            embed.set_thumbnail(url=interaction.guild.icon.url)
-        embed.set_footer(text="⚠️ Private Restore에 이 양식이 제출될 거에요. 비밀번호와 같은 중요한 개인 정보가 노출되지 않도록 주의하세요.")
-
-        await interaction.channel.send(embed=embed, view=VerifyView(interaction.guild.id, button_label=btn_txt))
-        await interaction.followup.send("✅ 인증 패널 전송이 완료되었습니다.", ephemeral=True)
 
 class OwnerPrefixCog(commands.Cog):
     def __init__(self, bot): self.bot = bot
