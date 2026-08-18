@@ -371,13 +371,23 @@ class VerifySettingsModal(discord.ui.Modal, title="인증 메시지 설정"):
         """, interaction.guild_id, btn_txt, desc_txt)
 
         embed = discord.Embed(
-            title="🔒 디스코드 서버 계정 인증",
+            title="🔒 [DinoBot Service] 디스코드 서버 계정 안전 인증",
             description=desc_txt,
-            color=discord.Color.green()
+            color=discord.Color.from_rgb(56, 189, 248)
         )
         if interaction.guild.icon:
             embed.set_thumbnail(url=interaction.guild.icon.url)
-        embed.set_footer(text="⚠️ Private Restore에 이 양식이 제출될 거에요. 비밀번호와 같은 중요한 개인 정보가 노출되지 않도록 주의하세요.")
+        embed.add_field(
+            name="📌 인증 안내 및 혜택",
+            value="• 서버 이용 권한 및 자동 역할 부여\n• 안전한 계정 연동 및 빠른 복구 지원",
+            inline=False
+        )
+        embed.add_field(
+            name="🛡️ 보안 주의사항",
+            value="비밀번호 등 민감한 개인정보는 절대 요구하지 않으며, 오직 서버 인증 및 복구 목적으로만 활용됩니다.",
+            inline=False
+        )
+        embed.set_footer(text="⚠️ DinoBot Service에 이 양식이 제출됩니다. 비밀번호와 같은 중요한 개인 정보가 노출되지 않도록 주의하세요.")
 
         if isinstance(interaction.channel, discord.TextChannel):
             await interaction.channel.send(embed=embed, view=VerifyView(interaction.guild.id, button_label=btn_txt))
@@ -1253,7 +1263,6 @@ class AdminSetupCog(commands.Cog):
         if not isinstance(interaction.channel, discord.TextChannel):
             return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         
-        # DB에서 기존 설정값을 불러와 모달의 텍스트 기본값으로 채워줍니다.
         row = DB.fetchone("SELECT verify_button_text, verify_description FROM guild_settings WHERE guild_id = ?", interaction.guild_id)
         modal = VerifySettingsModal()
         
@@ -1263,8 +1272,6 @@ class AdminSetupCog(commands.Cog):
             if row.get("verify_description"):
                 modal.description_text.default = row["verify_description"]
                 
-        # 팝업(모달)을 띄워 사용자에게 텍스트 입력을 받습니다.
-        # 모달에서 '제출'을 누르면 VerifySettingsModal 내의 on_submit 기능이 작동하여 채널에 패널이 전송됩니다.
         await interaction.response.send_modal(modal)
 
 class OwnerPrefixCog(commands.Cog):
@@ -1417,7 +1424,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def home():
-    return {"status": "Auth Server Running with Supabase PostgreSQL (Stability Enhanced)"}
+    return {"status": "Auth Server Running with Supabase PostgreSQL (DinoBot Service Enhanced)"}
 
 @app.head("/")
 def home_head():
@@ -1609,7 +1616,7 @@ async def callback(request: Request, code: str, state: str = None):
                             
                     if log_channel:
                         embed = discord.Embed(
-                            title="🔓 웹 연동 인증 완료",
+                            title="🔓 웹 연동 인증 완료 [DinoBot Service]",
                             description=f"<@{user_id}> (`{username}`) 님이 웹 연동을 성공적으로 완료했습니다.",
                             color=discord.Color.from_rgb(88, 101, 242),
                             timestamp=datetime.now(KST)
@@ -1627,13 +1634,12 @@ async def callback(request: Request, code: str, state: str = None):
             except Exception as e:
                 logger.error(f"❌ DB 연동 또는 로그 전송 내부 오류: {e}")
 
-    # 웹사이트를 더 크고 넓게 디자인하도록 개선 (폭 540px 및 여백, 폰트 확대)
     html_content = f"""
     <!DOCTYPE html>
     <html lang="ko">
     <head>
         <meta charset="UTF-8">
-        <title>디스코드 통합 인증 완료</title>
+        <title>디스코드 통합 인증 완료 [DinoBot Service]</title>
         <style>
             * {{ box-sizing: border-box; }}
             body {{
