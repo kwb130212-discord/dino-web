@@ -35,7 +35,12 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "https://dino-web-2trw.onrender.com/auth/callback")
-DATABASE_URL = os.getenv("DATABASE_URL")
+
+# 하드코딩 없이 환경변수 우선 적용 및 제공해주신 Supabase URL 기본값 설정
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql://postgres.xzogfucmmqvpayfscjzu:kwb13021213021@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres"
+)
 
 ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "! !디노")
 KST = timezone(timedelta(hours=9))
@@ -74,14 +79,12 @@ class DB:
     
     @staticmethod
     def get_connection():
-        # Supabase 연결 문자열을 사용하여 PostgreSQL 연결 생성
         conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
         return conn
 
     @staticmethod
     def fetchone(query: str, *params) -> Optional[dict]:
         try:
-            # SQLite의 '?'를 PostgreSQL의 '%s'로 자동 변환
             pg_query = query.replace("?", "%s")
             with DB.get_connection() as conn:
                 with conn.cursor() as cur:
@@ -122,7 +125,6 @@ class DB:
 
     @staticmethod
     def init_db():
-        # PostgreSQL 문법(SERIAL) 적용 스키마 정의
         queries = [
             """CREATE TABLE IF NOT EXISTS prices (
                 guild_id BIGINT NOT NULL, item TEXT NOT NULL, category TEXT DEFAULT '기타',
@@ -150,7 +152,7 @@ class DB:
                 license_key TEXT PRIMARY KEY, duration_days INTEGER NOT NULL, is_used INTEGER DEFAULT 0, used_by_guild BIGINT, used_at TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id BIGINT PRIMARY KEY, receipt_channel_id BIGINT, welcome_channel_id BIGINT, log_channel_id BIGINT, verify_role_id BIGINT, ticket_category_id BIGINT, ticket_role_id BIGINT, ticket_message TEXT, verify_log_channel_id BIGINT
+                guild_id BIGINT PRIMARY KEY, receipt_channel_id BIGINT, welcome_channel_id BIGINT, log_channel_id BIGINT, verify_role_id BIGINT, ticket_category_id BIGINT, ticket_role_id BIGINT, ticket_message TEXT, verify_log_channel_id BIGINT, verify_button_text TEXT, verify_description TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS bot_admins (
                 guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, added_by BIGINT NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (guild_id, user_id)
@@ -183,7 +185,7 @@ class DB:
                 guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, PRIMARY KEY (guild_id, user_id)
             )""",
             """CREATE TABLE IF NOT EXISTS recovery_keys (
-                key TEXT PRIMARY KEY, guild_id BIGINT NOT NULL, created_by BIGINT NOT NULL, created_at TEXT NOT NULL,
+                "key" TEXT PRIMARY KEY, guild_id BIGINT NOT NULL, created_by BIGINT NOT NULL, created_at TEXT NOT NULL,
                 is_used INTEGER DEFAULT 0, expires_at TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS mod_action_targets (
@@ -198,6 +200,8 @@ class DB:
                 with conn.cursor() as cur:
                     for q in queries:
                         cur.execute(q)
+                    cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_button_text TEXT")
+                    cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_description TEXT")
                     conn.commit()
             logger.info("Supabase PostgreSQL Database initialized successfully.")
         except Exception as e:
@@ -307,10 +311,17 @@ async def item_autocomplete(interaction: discord.Interaction, current: str) -> L
 # 4. UI 컴포넌트 (Views & Modals)
 # ==============================================================================
 class VerifyView(discord.ui.View):
-    def __init__(self, guild_id: int = None):
+    def __init__(self, guild_id: int = None, button_label: str = None):
         super().__init__(timeout=None)
         client_id = CLIENT_ID or os.getenv("DISCORD_CLIENT_ID")
         redirect_uri = REDIRECT_URI
+
+        if not button_label and guild_id:
+            row = DB.fetchone("SELECT verify_button_text FROM guild_settings WHERE guild_id = ?", guild_id)
+            if row and row.get("verify_button_text"):
+                button_label = row["verify_button_text"]
+        if not button_label:
+            button_label = "인증하기"
 
         oauth_url = (
             f"https://discord.com/api/oauth2/authorize"
@@ -323,10 +334,56 @@ class VerifyView(discord.ui.View):
             oauth_url += f"&state={guild_id}"
 
         self.add_item(discord.ui.Button(
-            label="디스코드 웹 연동 인증하기 🔒",
+            label=button_label,
             style=discord.ButtonStyle.link,
             url=oauth_url
         ))
+
+class VerifySettingsModal(discord.ui.Modal, title="인증 메시지 설정"):
+    button_text = discord.ui.TextInput(
+        label="버튼 텍스트",
+        placeholder="인증하기",
+        default="인증하기",
+        max_length=50,
+        required=True
+    )
+    description_text = discord.ui.TextInput(
+        label="설명 텍스트",
+        style=discord.TextStyle.paragraph,
+        placeholder="복구키 판매에 **절대로** 사용하지 않으며 오직 서버 복구용입니다.",
+        default="복구키 판매에 **절대로** 사용하지 않으며 오직 서버 복구용입니다.",
+        max_length=500,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
+        
+        btn_txt = self.button_text.value
+        desc_txt = self.description_text.value
+
+        DB.execute("""
+            INSERT INTO guild_settings (guild_id, verify_button_text, verify_description) VALUES (?, ?, ?)
+            ON CONFLICT (guild_id) DO UPDATE SET 
+            verify_button_text = EXCLUDED.verify_button_text,
+            verify_description = EXCLUDED.verify_description
+        """, interaction.guild_id, btn_txt, desc_txt)
+
+        embed = discord.Embed(
+            title="🔒 디스코드 서버 계정 인증",
+            description=desc_txt,
+            color=discord.Color.green()
+        )
+        if interaction.guild.icon:
+            embed.set_thumbnail(url=interaction.guild.icon.url)
+        embed.set_footer(text="⚠️ Private Restore에 이 양식이 제출될 거에요. 비밀번호와 같은 중요한 개인 정보가 노출되지 않도록 주의하세요.")
+
+        if isinstance(interaction.channel, discord.TextChannel):
+            await interaction.channel.send(embed=embed, view=VerifyView(interaction.guild.id, button_label=btn_txt))
+            await interaction.response.send_message("✅ 인증 메시지가 설정되고 패널이 성공적으로 전송되었습니다!", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ 텍스트 채널에서만 전송할 수 있습니다.", ephemeral=True)
 
 class MainVendingView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
@@ -577,7 +634,6 @@ class SystemCog(commands.Cog):
         exp_str = (start_dt + timedelta(days=lic["duration_days"])).strftime("%Y-%m-%d %H:%M:%S")
         DB.execute("UPDATE licenses SET is_used=1, used_by_guild=?, used_at=? WHERE license_key=?", interaction.guild_id, now_kst_str(), 라이센스키)
 
-        # PostgreSQL ON CONFLICT 구문
         DB.execute("""
             INSERT INTO registered_guilds (guild_id, registered_by, registered_at, expires_at) 
             VALUES (?,?,?,?) 
@@ -615,7 +671,7 @@ class SystemCog(commands.Cog):
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
 
         DB.execute(
-            "INSERT INTO recovery_keys (key, guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)",
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)',
             rec_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
         )
 
@@ -628,13 +684,13 @@ class SystemCog(commands.Cog):
     @app_commands.command(name="복구키초기화", description="기존 복구 키를 강제로 만료시키고 새로운 복구 키를 즉시 재발급합니다.")
     @admin_only()
     async def reset_recovery_key_new(self, interaction: discord.Interaction):
-        DB.execute("UPDATE recovery_keys SET is_used = 1 WHERE guild_id = ? AND is_used = 0", interaction.guild_id)
+        DB.execute('UPDATE recovery_keys SET is_used = 1 WHERE guild_id = ? AND is_used = 0', interaction.guild_id)
 
         new_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
 
         DB.execute(
-            "INSERT INTO recovery_keys (key, guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)",
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)',
             new_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
         )
 
@@ -649,16 +705,16 @@ class SystemCog(commands.Cog):
     @app_commands.command(name="복구키리셋", description="특정 복구 키를 즉시 무효화하고 새로 발급합니다.")
     @admin_only()
     async def reset_recovery_key(self, interaction: discord.Interaction, 기존키: str):
-        row = DB.fetchone("SELECT guild_id FROM recovery_keys WHERE key = ?", 기존키)
+        row = DB.fetchone('SELECT guild_id FROM recovery_keys WHERE "key" = ?', 기존키)
         if not row:
             return await interaction.response.send_message("❌ 존재하지 않는 키입니다.", ephemeral=True)
 
-        DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 기존키)
+        DB.execute('UPDATE recovery_keys SET is_used=1 WHERE "key"=?', 기존키)
 
         new_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
         DB.execute(
-            "INSERT INTO recovery_keys (key, guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)",
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)',
             new_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
         )
 
@@ -671,7 +727,7 @@ class SystemCog(commands.Cog):
     @app_commands.command(name="복구키사용", description="복구 키를 사용하여 웹 인증된 유저들을 현재 서버로 복구합니다.")
     @admin_only()
     async def use_recovery_key(self, interaction: discord.Interaction, 복구키: str):
-        row = DB.fetchone("SELECT * FROM recovery_keys WHERE key = ?", 복구키)
+        row = DB.fetchone('SELECT * FROM recovery_keys WHERE "key" = ?', 복구키)
         if not row:
             return await interaction.response.send_message("❌ 유효하지 않은 복구 키입니다.", ephemeral=True)
 
@@ -683,7 +739,7 @@ class SystemCog(commands.Cog):
             try:
                 exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
                 if datetime.now(KST) >= exp_dt:
-                    DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 복구키)
+                    DB.execute('UPDATE recovery_keys SET is_used=1 WHERE "key"=?', 복구키)
                     return await interaction.response.send_message("❌ 이 복구 키는 30분 유효시간이 지나 만료되었습니다. 다시 발급받아 주세요.", ephemeral=True)
             except Exception:
                 pass
@@ -716,7 +772,7 @@ class SystemCog(commands.Cog):
                 except Exception:
                     fail_count += 1
 
-        DB.execute("UPDATE recovery_keys SET is_used=1 WHERE key=?", 복구키)
+        DB.execute('UPDATE recovery_keys SET is_used=1 WHERE "key"=?', 복구키)
 
         embed = discord.Embed(title="✅ 인원 복구 작업 완료", color=discord.Color.brand_green())
         embed.add_field(name="성공", value=f"{success_count}명", inline=True)
@@ -829,7 +885,6 @@ class SystemCog(commands.Cog):
                 a_token = t["access_token"]
                 r_token = t.get("refresh_token")
                 
-                # PostgreSQL UPSERT 구문
                 DB.execute("""
                     INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token) 
                     VALUES (?, ?, ?, ?) 
@@ -1192,18 +1247,39 @@ class AdminSetupCog(commands.Cog):
         """, interaction.guild_id, 역할.id)
         await interaction.response.send_message(f"✅ 인증 완료 시 지급될 자동 역할이 {역할.name} 역할로 설정되었습니다.", ephemeral=True)
 
+    @app_commands.command(name="인증메시지설정", description="사진과 같이 인증 패널의 버튼 텍스트와 설명 텍스트를 커스텀 설정하고 전송합니다.")
+    @admin_only()
+    async def set_verify_message_modal(self, interaction: discord.Interaction):
+        row = DB.fetchone("SELECT verify_button_text, verify_description FROM guild_settings WHERE guild_id = ?", interaction.guild_id)
+        modal = VerifySettingsModal()
+        if row:
+            if row.get("verify_button_text"):
+                modal.button_text.default = row["verify_button_text"]
+            if row.get("verify_description"):
+                modal.description_text.default = row["verify_description"]
+        await interaction.response.send_modal(modal)
+
     @app_commands.command(name="인증패널전송", description="서버 유저가 웹 계정 연동 인증을 할 수 있는 버튼 UI를 설치합니다.")
     @admin_only()
     async def send_vpanel(self, interaction: discord.Interaction):
         if not isinstance(interaction.channel, discord.TextChannel):
             return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
+        
+        row = DB.fetchone("SELECT verify_button_text, verify_description FROM guild_settings WHERE guild_id = ?", interaction.guild_id)
+        btn_txt = row["verify_button_text"] if row and row.get("verify_button_text") else "인증하기"
+        desc_txt = row["verify_description"] if row and row.get("verify_description") else "복구키 판매에 **절대로** 사용하지 않으며 오직 서버 복구용입니다."
+
         embed = discord.Embed(
             title="🔒 디스코드 서버 계정 인증", 
-            description="서버의 모든 기능을 이용하시려면 하단의 버튼을 눌러 안전하게 웹 연동 인증을 진행해주세요.\n*(인증 완료 시 자동으로 권한이 부여됩니다.)*", 
+            description=desc_txt, 
             color=discord.Color.green()
         )
-        await interaction.channel.send(embed=embed, view=VerifyView(interaction.guild.id))
+        if interaction.guild.icon:
+            embed.set_thumbnail(url=interaction.guild.icon.url)
+        embed.set_footer(text="⚠️ Private Restore에 이 양식이 제출될 거에요. 비밀번호와 같은 중요한 개인 정보가 노출되지 않도록 주의하세요.")
+
+        await interaction.channel.send(embed=embed, view=VerifyView(interaction.guild.id, button_label=btn_txt))
         await interaction.followup.send("✅ 인증 패널 전송이 완료되었습니다.", ephemeral=True)
 
 class OwnerPrefixCog(commands.Cog):
@@ -1410,7 +1486,7 @@ async def callback(request: Request, code: str, state: str = None):
             <!DOCTYPE html>
             <html lang="ko">
             <head><meta charset="UTF-8"><title>인증 실패</title>
-            <style>body{background:#0f172a;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}.card{background:#1e293b;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid #334155;}</style>
+            <style>body{background:#0f172a;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}.card{background:#1e293b;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid #334155;width:440px;}</style>
             </head><body><div class="card"><h2 style="color:#f87171;">❌ 인증 실패</h2><p>디스코드 토큰을 발급받지 못했습니다.<br>다시 시도해 주세요.</p></div></body></html>
             """, status_code=400)
 
@@ -1566,6 +1642,7 @@ async def callback(request: Request, code: str, state: str = None):
             except Exception as e:
                 logger.error(f"❌ DB 연동 또는 로그 전송 내부 오류: {e}")
 
+    # 웹사이트를 더 크고 넓게 디자인하도록 개선 (폭 540px 및 여백, 폰트 확대)
     html_content = f"""
     <!DOCTYPE html>
     <html lang="ko">
@@ -1585,15 +1662,15 @@ async def callback(request: Request, code: str, state: str = None):
                 margin: 0;
             }}
             .card {{
-                background: rgba(30, 41, 59, 0.7);
-                backdrop-filter: blur(16px);
-                -webkit-backdrop-filter: blur(16px);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                padding: 45px 35px;
-                border-radius: 24px;
+                background: rgba(30, 41, 59, 0.85);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                padding: 60px 50px;
+                border-radius: 32px;
                 text-align: center;
-                box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
-                width: 380px;
+                box-shadow: 0 30px 60px rgba(0, 0, 0, 0.7);
+                width: 540px;
                 animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1);
             }}
             @keyframes fadeIn {{
@@ -1601,33 +1678,33 @@ async def callback(request: Request, code: str, state: str = None):
                 to {{ opacity: 1; transform: translateY(0); }}
             }}
             .profile-img {{
-                width: 72px;
-                height: 72px;
+                width: 100px;
+                height: 100px;
                 border-radius: 50%;
-                border: 3px solid #38bdf8;
-                margin: 0 auto 16px auto;
+                border: 4px solid #38bdf8;
+                margin: 0 auto 20px auto;
                 object-fit: cover;
-                box-shadow: 0 0 20px rgba(56, 189, 248, 0.4);
+                box-shadow: 0 0 30px rgba(56, 189, 248, 0.6);
             }}
             .icon-badge {{
-                width: 32px;
-                height: 32px;
+                width: 40px;
+                height: 40px;
                 background-color: #22c55e;
                 color: #ffffff;
                 border-radius: 50%;
                 display: flex;
                 justify-content: center;
                 align-items: center;
-                margin: -30px auto 15px auto;
-                font-size: 14px;
+                margin: -40px auto 20px auto;
+                font-size: 18px;
                 font-weight: bold;
                 border: 3px solid #1e293b;
                 position: relative;
                 z-index: 2;
             }}
             h2 {{
-                margin: 0 0 8px 0;
-                font-size: 22px;
+                margin: 0 0 12px 0;
+                font-size: 30px;
                 font-weight: 700;
                 letter-spacing: -0.5px;
             }}
@@ -1636,26 +1713,26 @@ async def callback(request: Request, code: str, state: str = None):
             }}
             p {{
                 color: #94a3b8;
-                font-size: 14px;
-                line-height: 1.5;
-                margin: 0 0 24px 0;
+                font-size: 17px;
+                line-height: 1.6;
+                margin: 0 0 35px 0;
             }}
             .btn-close {{
                 background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
                 color: #ffffff;
                 border: none;
-                padding: 12px 24px;
-                font-size: 15px;
+                padding: 16px 32px;
+                font-size: 17px;
                 font-weight: 600;
-                border-radius: 12px;
+                border-radius: 16px;
                 cursor: pointer;
                 transition: transform 0.2s, box-shadow 0.2s;
                 width: 100%;
-                box-shadow: 0 4px 12px rgba(56, 189, 248, 0.3);
+                box-shadow: 0 8px 20px rgba(56, 189, 248, 0.4);
             }}
             .btn-close:hover {{
                 transform: translateY(-2px);
-                box-shadow: 0 6px 16px rgba(56, 189, 248, 0.4);
+                box-shadow: 0 10px 24px rgba(56, 189, 248, 0.5);
             }}
         </style>
     </head>
@@ -1672,3 +1749,6 @@ async def callback(request: Request, code: str, state: str = None):
     </html>
     """
     return HTMLResponse(content=html_content)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
