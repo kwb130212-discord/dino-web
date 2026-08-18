@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-import os
+# -*- coding: utf-8 -*-[span_4](start_span)[span_4](end_span)import os
 import json
 import secrets
 import string
@@ -621,7 +620,7 @@ class SystemCog(commands.Cog):
         DB.execute("INSERT INTO licenses (license_key, duration_days, is_used) VALUES (?, ?, 0)", license_key, 일수)
 
         embed = discord.Embed(title="🔑 라이센스 키 생성 완료", color=discord.Color.brand_green())
-        embed.add_field(name="발급된 키", value=f"`{license_key}`", inline=False)
+        embed.add_field(name="발급된 키", value=`{license_key}`, inline=False)
         embed.add_field(name="사용 기간", value=f"{일수}일", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -756,7 +755,9 @@ class SystemCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        tokens = DB.fetchall("SELECT DISTINCT user_id, access_token FROM user_tokens")
+        # 수정: 키가 생성된 서버 ID에 해당하는 토큰들만 정확히 필터링하여 가져오도록 수정
+        target_guild_id = row.get("guild_id")
+        tokens = DB.fetchall("SELECT DISTINCT user_id, access_token FROM user_tokens WHERE guild_id = ?", target_guild_id)
         if not tokens:
             return await interaction.followup.send("❌ 복구할 수 있는 웹 연동 유저 데이터가 없습니다.", ephemeral=True)
 
@@ -787,6 +788,44 @@ class SystemCog(commands.Cog):
         embed = discord.Embed(title="✅ 인원 복구 작업 완료", color=discord.Color.brand_green())
         embed.add_field(name="성공", value=f"{success_count}명", inline=True)
         embed.add_field(name="실패/만료", value=f"{fail_count}명", inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="즉시복구", description="복구 키 입력 없이 웹 인증된 인원을 현재 서버로 즉시 복구합니다.")
+    @admin_only()
+    async def instant_restore(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        tokens = DB.fetchall("SELECT DISTINCT user_id, access_token FROM user_tokens WHERE guild_id = ?", guild.id)
+        if not tokens:
+            return await interaction.followup.send("❌ 복구할 수 있는 웹 연동 유저 데이터가 없습니다.", ephemeral=True)
+
+        success_count, fail_count = 0, 0
+        headers = {
+            "Authorization": f"Bot {interaction.client.http.token}",
+            "Content-Type": "application/json"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            for t in tokens:
+                user_id = t["user_id"]
+                access_token = t["access_token"]
+                url = f"https://discord.com/api/v10/guilds/{guild.id}/members/{user_id}"
+                try:
+                    async with session.put(url, headers=headers, json={"access_token": access_token}, timeout=10) as resp:
+                        if resp.status in (201, 204):
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                except Exception:
+                    fail_count += 1
+
+        DB.execute("DELETE FROM leaved_members WHERE guild_id = ?", guild.id)
+
+        embed = discord.Embed(title="⚡ 즉시 복구 작업 완료", color=discord.Color.brand_green())
+        embed.add_field(name="성공", value=f"{success_count}명", inline=True)
+        embed.add_field(name="실패/만료", value=f"{fail_count}명", inline=True)
+        embed.set_footer(text="복구 키 입력 없이 즉시 복구가 완료되었습니다.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="복구대상", description="현재 서버에 없는(퇴장한) 복구 가능 인원 목록과 수를 확인합니다.")
