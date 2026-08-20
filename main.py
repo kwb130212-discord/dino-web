@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-[span_4](start_span)[span_4](end_span)import os
+# -*- coding: utf-8 -*-
+import os
 import json
 import secrets
 import string
@@ -35,7 +36,6 @@ CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "https://dino-web-2trw.onrender.com/auth/callback")
 
-# 하드코딩 없이 환경변수 우선 적용 및 제공해주신 Supabase URL 기본값 설정
 DATABASE_URL = os.getenv(
     "DATABASE_URL", 
     "postgresql://postgres.xzogfucmmqvpayfscjzu:kwb13021213021@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres"
@@ -185,7 +185,7 @@ class DB:
             )""",
             """CREATE TABLE IF NOT EXISTS recovery_keys (
                 "key" TEXT PRIMARY KEY, guild_id BIGINT NOT NULL, created_by BIGINT NOT NULL, created_at TEXT NOT NULL,
-                is_used INTEGER DEFAULT 0, expires_at TEXT
+                is_used INTEGER DEFAULT 0, expires_at TEXT, is_permanent INTEGER DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS mod_action_targets (
                 message_id BIGINT PRIMARY KEY, guild_id BIGINT NOT NULL, target_user_id BIGINT NOT NULL, created_at TEXT NOT NULL
@@ -201,6 +201,7 @@ class DB:
                         cur.execute(q)
                     cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_button_text TEXT")
                     cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_description TEXT")
+                    cur.execute("ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS is_permanent INTEGER DEFAULT 0")
                     conn.commit()
             logger.info("Supabase PostgreSQL Database initialized successfully.")
         except Exception as e:
@@ -620,7 +621,7 @@ class SystemCog(commands.Cog):
         DB.execute("INSERT INTO licenses (license_key, duration_days, is_used) VALUES (?, ?, 0)", license_key, 일수)
 
         embed = discord.Embed(title="🔑 라이센스 키 생성 완료", color=discord.Color.brand_green())
-        embed.add_field(name="발급된 키", value=`{license_key}`, inline=False)
+        embed.add_field(name="발급된 키", value=f"`{license_key}`", inline=False)
         embed.add_field(name="사용 기간", value=f"{일수}일", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -673,21 +674,56 @@ class SystemCog(commands.Cog):
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="복구키생성", description="인원 복구를 위한 복구 키를 생성합니다. (30분간만 유효)")
+    @app_commands.command(name="복구키생성", description="인원 복구를 위한 일회용 복구 키를 생성합니다. (30분간만 유효)")
     @admin_only()
     async def create_recovery_key(self, interaction: discord.Interaction):
         rec_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
 
         DB.execute(
-            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)',
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at, is_permanent) VALUES (?, ?, ?, ?, 0, ?, 0)',
             rec_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
         )
 
-        embed = discord.Embed(title="🔑 인원 복구 키 발급 완료", color=discord.Color.green())
+        embed = discord.Embed(title="🔑 인원 일회용 복구 키 발급 완료", color=discord.Color.green())
         embed.add_field(name="발급된 키", value=f"`{rec_key}`", inline=False)
-        embed.add_field(name="⏱️ 유효 시간", value="**30분** (경과 시 자동 무효화)", inline=False)
-        embed.description = "이 키는 다른 서버에서도 인증된 인원을 복구할 때 사용할 수 있습니다."
+        embed.add_field(name="⏱️ 유효 시간", value="**30분** (사용 시 또는 시간 경과 시 자동 무효화)", inline=False)
+        embed.description = "이 키는 다른 서버에서도 인증된 인원을 복구할 때 1회 사용할 수 있습니다."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="일회용복구키생성", description="시간 제한과 1회성 소멸 특성을 가진 일회용 복구 키를 생성합니다.")
+    @admin_only()
+    async def create_once_recovery_key(self, interaction: discord.Interaction, 유효분: Optional[int] = 30):
+        if 유효분 <= 0:
+            return await interaction.response.send_message("❌ 유효 시간은 1분 이상이어야 합니다.", ephemeral=True)
+
+        rec_key = f"ONCE-{gen_secure_code(4)}-{gen_secure_code(4)}"
+        expires_at = (datetime.now(KST) + timedelta(minutes=유효분)).strftime("%Y-%m-%d %H:%M:%S")
+
+        DB.execute(
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at, is_permanent) VALUES (?, ?, ?, ?, 0, ?, 0)',
+            rec_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
+        )
+
+        embed = discord.Embed(title="⚡ 일회용 복구 키 발급 완료", color=discord.Color.gold())
+        embed.add_field(name="발급된 키", value=f"`{rec_key}`", inline=False)
+        embed.add_field(name="⏱️ 유효 시간", value=f"**{유효분}분** (1회 복구 후 소멸)", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="영구복구키생성", description="만료되지 않고 제한 없이 사용할 수 있는 영구 복구 키를 생성합니다.")
+    @admin_only()
+    async def create_permanent_recovery_key(self, interaction: discord.Interaction):
+        rec_key = f"PERM-{gen_secure_code(4)}-{gen_secure_code(4)}-{gen_secure_code(4)}"
+
+        DB.execute(
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at, is_permanent) VALUES (?, ?, ?, ?, 0, NULL, 1)',
+            rec_key, interaction.guild_id, interaction.user.id, now_kst_str()
+        )
+
+        embed = discord.Embed(title="♾️ 영구 복구 키 발급 완료", color=discord.Color.purple())
+        embed.add_field(name="발급된 영구 키", value=f"`{rec_key}`", inline=False)
+        embed.add_field(name="🛡️ 만료 여부", value="**무제한 / 영구적 (소멸되지 않음)**", inline=False)
+        embed.description = "이 영구 키는 여러 번 사용이 가능하며 강제 리셋하기 전까지 지속 지원됩니다."
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="복구키초기화", description="기존 복구 키를 강제로 만료시키고 새로운 복구 키를 즉시 재발급합니다.")
@@ -699,7 +735,7 @@ class SystemCog(commands.Cog):
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
 
         DB.execute(
-            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)',
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at, is_permanent) VALUES (?, ?, ?, ?, 0, ?, 0)',
             new_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
         )
 
@@ -723,7 +759,7 @@ class SystemCog(commands.Cog):
         new_key = f"REC-{gen_secure_code(4)}-{gen_secure_code(4)}"
         expires_at = (datetime.now(KST) + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
         DB.execute(
-            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at) VALUES (?, ?, ?, ?, 0, ?)',
+            'INSERT INTO recovery_keys ("key", guild_id, created_by, created_at, is_used, expires_at, is_permanent) VALUES (?, ?, ?, ?, 0, ?, 0)',
             new_key, interaction.guild_id, interaction.user.id, now_kst_str(), expires_at
         )
 
@@ -733,31 +769,32 @@ class SystemCog(commands.Cog):
         embed.add_field(name="⏱️ 유효 시간", value="**30분**", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="복구키사용", description="복구 키를 사용하여 웹 인증된 유저들을 현재 서버로 복구합니다.")
+    @app_commands.command(name="복구키사용", description="복구 키(일회용/영구)를 사용하여 웹 인증된 유저들을 현재 서버로 복구합니다.")
     @admin_only()
     async def use_recovery_key(self, interaction: discord.Interaction, 복구키: str):
         row = DB.fetchone('SELECT * FROM recovery_keys WHERE "key" = ?', 복구키)
         if not row:
             return await interaction.response.send_message("❌ 유효하지 않은 복구 키입니다.", ephemeral=True)
 
-        if row.get("is_used"):
-            return await interaction.response.send_message("❌ 이미 사용되었거나 강제 리셋된 키입니다.", ephemeral=True)
+        is_perm = row.get("is_permanent", 0) == 1
 
-        exp_str = row.get("expires_at")
-        if exp_str:
-            try:
-                exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-                if datetime.now(KST) >= exp_dt:
-                    DB.execute('UPDATE recovery_keys SET is_used=1 WHERE "key"=?', 복구키)
-                    return await interaction.response.send_message("❌ 이 복구 키는 30분 유효시간이 지나 만료되었습니다. 다시 발급받아 주세요.", ephemeral=True)
-            except Exception:
-                pass
+        if not is_perm:
+            if row.get("is_used"):
+                return await interaction.response.send_message("❌ 이미 사용되었거나 강제 리셋된 일회용 복구 키입니다.", ephemeral=True)
+
+            exp_str = row.get("expires_at")
+            if exp_str:
+                try:
+                    exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+                    if datetime.now(KST) >= exp_dt:
+                        DB.execute('UPDATE recovery_keys SET is_used=1 WHERE "key"=?', 복구키)
+                        return await interaction.response.send_message("❌ 이 복구 키는 유효시간이 지나 만료되었습니다. 다시 발급받아 주세요.", ephemeral=True)
+                except Exception:
+                    pass
 
         await interaction.response.defer(ephemeral=True)
 
-        # 수정: 키가 생성된 서버 ID에 해당하는 토큰들만 정확히 필터링하여 가져오도록 수정
-        target_guild_id = row.get("guild_id")
-        tokens = DB.fetchall("SELECT DISTINCT user_id, access_token FROM user_tokens WHERE guild_id = ?", target_guild_id)
+        tokens = DB.fetchall("SELECT DISTINCT user_id, access_token FROM user_tokens")
         if not tokens:
             return await interaction.followup.send("❌ 복구할 수 있는 웹 연동 유저 데이터가 없습니다.", ephemeral=True)
 
@@ -783,49 +820,13 @@ class SystemCog(commands.Cog):
                 except Exception:
                     fail_count += 1
 
-        DB.execute('UPDATE recovery_keys SET is_used=1 WHERE "key"=?', 복구키)
+        if not is_perm:
+            DB.execute('UPDATE recovery_keys SET is_used=1 WHERE "key"=?', 복구키)
 
         embed = discord.Embed(title="✅ 인원 복구 작업 완료", color=discord.Color.brand_green())
+        embed.add_field(name="사용된 키 종류", value="♾️ 영구 복구 키" if is_perm else "⚡ 일회용 복구 키", inline=False)
         embed.add_field(name="성공", value=f"{success_count}명", inline=True)
         embed.add_field(name="실패/만료", value=f"{fail_count}명", inline=True)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="즉시복구", description="복구 키 입력 없이 웹 인증된 인원을 현재 서버로 즉시 복구합니다.")
-    @admin_only()
-    async def instant_restore(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
-
-        tokens = DB.fetchall("SELECT DISTINCT user_id, access_token FROM user_tokens WHERE guild_id = ?", guild.id)
-        if not tokens:
-            return await interaction.followup.send("❌ 복구할 수 있는 웹 연동 유저 데이터가 없습니다.", ephemeral=True)
-
-        success_count, fail_count = 0, 0
-        headers = {
-            "Authorization": f"Bot {interaction.client.http.token}",
-            "Content-Type": "application/json"
-        }
-
-        async with aiohttp.ClientSession() as session:
-            for t in tokens:
-                user_id = t["user_id"]
-                access_token = t["access_token"]
-                url = f"https://discord.com/api/v10/guilds/{guild.id}/members/{user_id}"
-                try:
-                    async with session.put(url, headers=headers, json={"access_token": access_token}, timeout=10) as resp:
-                        if resp.status in (201, 204):
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                except Exception:
-                    fail_count += 1
-
-        DB.execute("DELETE FROM leaved_members WHERE guild_id = ?", guild.id)
-
-        embed = discord.Embed(title="⚡ 즉시 복구 작업 완료", color=discord.Color.brand_green())
-        embed.add_field(name="성공", value=f"{success_count}명", inline=True)
-        embed.add_field(name="실패/만료", value=f"{fail_count}명", inline=True)
-        embed.set_footer(text="복구 키 입력 없이 즉시 복구가 완료되었습니다.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="복구대상", description="현재 서버에 없는(퇴장한) 복구 가능 인원 목록과 수를 확인합니다.")
@@ -842,7 +843,7 @@ class SystemCog(commands.Cog):
             embed = discord.Embed(title=f"📋 복구 가능 대기열 (총 {count}명)", description=target_list, color=discord.Color.blurple())
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="서버백업", description="상점 데이터, 채널/역할 구조 및 인증된 인원 토큰 정보를 함께 백업합니다.")
+    @app_commands.command(name="백업키생성", description="서버 구조, 상점, 연동 토큰 정보를 저장하고 백업키를 생성합니다.")
     @admin_only()
     async def backup_server(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -880,10 +881,27 @@ class SystemCog(commands.Cog):
         bkey = f"BK-{gen_secure_code(10)}"
         DB.execute("INSERT INTO server_backups (backup_key, guild_id, backup_data, created_at) VALUES (?,?,?,?)", bkey, g, json.dumps(data), now_kst_str())
         
-        embed = discord.Embed(title="💾 서버 및 인증 인원 통합 백업 완료", color=discord.Color.green())
-        embed.add_field(name="백업 복구 키", value=f"`{bkey}`", inline=False)
-        embed.set_footer(text="이 키로 채널, 역할, 상점 구조뿐만 아니라 웹 인증된 인원 정보까지 함께 복원할 수 있습니다.")
+        embed = discord.Embed(title="💾 서버 및 백업 키 생성 완료", color=discord.Color.green())
+        embed.add_field(name="발급된 백업 키", value=f"`{bkey}`", inline=False)
+        embed.set_footer(text="이 백업 키로 채널, 역할, 상점 구조뿐만 아니라 웹 인증된 인원 정보까지 함께 복원할 수 있습니다.")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="서버백업", description="상점 데이터, 채널/역할 구조 및 인증된 인원 토큰 정보를 백업합니다.")
+    @admin_only()
+    async def backup_server_legacy(self, interaction: discord.Interaction):
+        await self.backup_server(interaction)
+
+    @app_commands.command(name="백업키목록", description="현재 서버의 백업 키 리스트를 확인합니다.")
+    @admin_only()
+    async def list_backup_keys(self, interaction: discord.Interaction):
+        rows = DB.fetchall("SELECT backup_key, created_at FROM server_backups WHERE guild_id = ? ORDER BY created_at DESC", interaction.guild_id)
+        if not rows:
+            return await interaction.response.send_message("❌ 생성된 백업 키가 없습니다.", ephemeral=True)
+
+        embed = discord.Embed(title="📦 현재 서버 백업 키 목록", color=discord.Color.blue())
+        for r in rows:
+            embed.add_field(name=f"키: `{r['backup_key']}`", value=f"생성 일시: {r['created_at']}", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="서버복구", description="백업 키로 역할, 채널, 상점 데이터 및 인증된 인원 정보를 모두 복구합니다.")
     @admin_only()
