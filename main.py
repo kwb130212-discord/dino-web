@@ -101,7 +101,7 @@ class DB:
 
     @classmethod
     def init_pool(cls) -> None:
-        if cls._pool is None:
+        if cls._pool is None or cls._pool.closed:
             cls._pool = pg_pool.ThreadedConnectionPool(
                 minconn=2,
                 maxconn=20,
@@ -117,7 +117,7 @@ class DB:
 
     @classmethod
     def close_pool(cls) -> None:
-        if cls._pool is not None:
+        if cls._pool is not None and not cls._pool.closed:
             cls._pool.closeall()
             cls._pool = None
             logger.info("PostgreSQL ThreadedConnectionPool이 정상적으로 종료되었습니다.")
@@ -125,18 +125,27 @@ class DB:
     @classmethod
     @contextmanager
     def get_connection(cls):
-        if cls._pool is None:
+        if cls._pool is None or cls._pool.closed:
             cls.init_pool()
-        conn = cls._pool.getconn()
+        conn = None
         broken = False
         try:
+            conn = cls._pool.getconn()
+            # 끊어진 커넥션 감지 및 즉시 재연결
+            if conn and conn.closed != 0:
+                try:
+                    cls._pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = cls._pool.getconn()
             yield conn
         except Exception as e:
             broken = True
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             raise e
         finally:
             if cls._pool and conn:
@@ -936,15 +945,16 @@ class SystemCog(commands.Cog):
                 access_token = t["access_token"]
                 url = f"https://discord.com/api/v10/guilds/{guild.id}/members/{user_id}"
                 try:
-                    async with session.put(url, headers=headers, json={"access_token": access_token}, timeout=10) as resp:
+                    async with session.put(url, headers=headers, json={"access_token": access_token}, timeout=15) as resp:
                         if resp.status in (201, 204):
                             success_count += 1
                         elif resp.status == 429:
                             # Rate Limit 방어
                             retry_after = 1.0
                             try:
-                                data = await resp.json()
-                                retry_after = data.get("retry_after", 1.0)
+                                if "application/json" in resp.headers.get("Content-Type", ""):
+                                    data = await resp.json()
+                                    retry_after = data.get("retry_after", 1.0)
                             except Exception:
                                 pass
                             await asyncio.sleep(retry_after)
@@ -953,7 +963,7 @@ class SystemCog(commands.Cog):
                             fail_count += 1
                 except Exception:
                     fail_count += 1
-                # Discord API Rate Limit 방지를 위한 지연 (1초당 최대 1개)
+                # Discord API Rate Limit 방지를 위한 지연
                 await asyncio.sleep(0.5)
 
         if key_type == "one_time":
@@ -1474,7 +1484,7 @@ async def health():
 
 @app.get("/auth/callback", response_class=HTMLResponse)
 async def callback(request: Request, code: str, state: Optional[str] = None):
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             token_resp = await client.post(
                 "https://discord.com/api/oauth2/token",
@@ -1487,39 +1497,56 @@ async def callback(request: Request, code: str, state: Optional[str] = None):
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"}
             )
+        except Exception as e:
+            logger.error(f"OAuth2 토큰 요청 통신 오류: {e}")
+            return HTMLResponse(content="<h2>❌ 인증 실패: 디스코드 서버와의 통신에 실패했습니다.</h2>", status_code=500)
+
+        if token_resp.status_code != 200:
+            logger.error(f"OAuth2 토큰 요청 실패 (HTTP {token_resp.status_code})")
+            return HTMLResponse(content=f"<h2>❌ 인증 실패: 디스코드 토큰 발급 실패 (코드: {token_resp.status_code})</h2>", status_code=400)
+
+        try:
             token_data = token_resp.json()
         except Exception as e:
-            logger.error(f"OAuth2 토큰 교환 오류: {e}")
-            token_data = {}
+            logger.error(f"OAuth2 토큰 응답 JSON 파싱 실패 (Cloudflare 에러 가능성): {e}")
+            return HTMLResponse(content="<h2>❌ 인증 실패: 올바르지 않은 응답 형식입니다. 다시 시도해 주세요.</h2>", status_code=502)
 
-        if "access_token" not in token_data:
-            return HTMLResponse(content="<h2>❌ 인증 실패: 디스코드 토큰 발급에 실패했습니다.</h2>", status_code=400)
-
-        access_token = token_data["access_token"]
+        access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
+
+        if not access_token:
+            return HTMLResponse(content="<h2>❌ 인증 실패: 유효한 접근 토큰을 발급받지 못했습니다.</h2>", status_code=400)
 
         try:
             user_resp = await client.get(
                 "https://discord.com/api/users/@me",
                 headers={"Authorization": f"Bearer {access_token}"}
             )
+        except Exception as e:
+            logger.error(f"유저 데이터 요청 통신 오류: {e}")
+            return HTMLResponse(content="<h2>❌ 인증 실패: 유저 정보를 불러오지 못했습니다.</h2>", status_code=500)
+
+        if user_resp.status_code != 200:
+            logger.error(f"유저 데이터 조회 실패 (HTTP {user_resp.status_code})")
+            return HTMLResponse(content=f"<h2>❌ 인증 실패: 사용자 정보 조회 실패 (코드: {user_resp.status_code})</h2>", status_code=400)
+
+        try:
             user_data = user_resp.json()
         except Exception as e:
-            logger.error(f"유저 데이터 조회 오류: {e}")
-            user_data = {}
+            logger.error(f"유저 데이터 JSON 파싱 실패: {e}")
+            return HTMLResponse(content="<h2>❌ 인증 실패: 유저 데이터 형식이 올바르지 않습니다.</h2>", status_code=502)
 
         user_id = user_data.get("id")
         username = user_data.get("username", "알 수 없음")
 
         guild_id_int = int(state) if state and state.isdigit() else None
 
-        if user_id:
-            if guild_id_int:
-                await DB.execute(
-                    "INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token) VALUES (%s, %s, %s, %s) "
-                    "ON CONFLICT (guild_id, user_id) DO UPDATE SET access_token = EXCLUDED.access_token, refresh_token = EXCLUDED.refresh_token",
-                    guild_id_int, int(user_id), access_token, refresh_token
-                )
+        if user_id and guild_id_int:
+            await DB.execute(
+                "INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE SET access_token = EXCLUDED.access_token, refresh_token = EXCLUDED.refresh_token",
+                guild_id_int, int(user_id), access_token, refresh_token
+            )
 
     return HTMLResponse(content=f"<html><body><h2>✅ {username}님, 인증이 완벽하게 처리되었습니다!</h2></body></html>")
 
