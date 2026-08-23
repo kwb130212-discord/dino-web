@@ -10,6 +10,7 @@ import core
 from startup_fixes import install as install_startup_fixes
 from web_entry import install as install_web_entry
 from dashboard_auth import install as install_dashboard_auth
+from legacy_oauth import install as install_legacy_oauth
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
@@ -18,9 +19,11 @@ from dashboard_shortcuts import install as install_dashboard_shortcuts
 
 # Must run before feature routes/queries touch legacy PostgreSQL installations.
 install_startup_fixes(core)
-# Public home/login aliases are installed first; OAuth routes are installed next.
+# Public home/login aliases are installed first.
 install_web_entry(core)
-# Stable authentication UI is installed before the management UI.
+# Keep the original production OAuth contract: /login -> /auth/callback.
+install_legacy_oauth(core)
+# Keep the richer authentication UI available for non-legacy routes.
 install_dashboard_auth(core)
 install_control_center(core)
 install_tutorial_logs(core)
