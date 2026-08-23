@@ -14,19 +14,17 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 log = logging.getLogger("DinoBot.Auth")
 
+# Production URL is intentionally fixed so Discord OAuth never depends on a
+# missing/mismatched Render environment variable.
+BASE_URL = "https://dino-web-2trw.onrender.com"
+REDIRECT_URI = f"{BASE_URL}/dashboard/callback"
+
 
 def install(core) -> None:
     app = core.app
 
-    client_id = os.getenv("DISCORD_CLIENT_ID", "")
-    client_secret = os.getenv("DISCORD_CLIENT_SECRET", "")
-    # Use the single REDIRECT_URI environment variable everywhere.
-    # Keep the production callback as the safe fallback so Render works even
-    # before the environment variable is configured.
-    redirect_uri = os.getenv(
-        "REDIRECT_URI",
-        "https://dino-web-2trw.onrender.com/dashboard/callback",
-    ).strip()
+    client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
+    client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
     support_url = os.getenv("SUPPORT_SERVER_URL", "https://discord.gg/UPEpr7fX")
     invite_url = os.getenv("DISCORD_BOT_INVITE_URL", "")
     if not invite_url and client_id:
@@ -73,7 +71,7 @@ def install(core) -> None:
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot Control Center</div><h1 class="title">로그인을 사용할 수 없습니다.</h1><p class="desc">DISCORD_CLIENT_ID 환경변수가 설정되지 않았습니다.</p></main></div>')
         state = secrets.token_urlsafe(32)
         request.session["oauth_state"] = state
-        params = {"client_id": client_id,"redirect_uri": redirect_uri,"response_type": "code","scope": "identify","state": state,"prompt": "consent"}
+        params = {"client_id": client_id,"redirect_uri": REDIRECT_URI,"response_type": "code","scope": "identify","state": state,"prompt": "consent"}
         auth_url = "https://discord.com/oauth2/authorize?" + urlencode(params)
         body = '<div class="wrap"><main class="card"><div class="brand">DinoBot Control Center</div><h1 class="title">대시보드 로그인</h1><p class="desc">Discord 계정으로 로그인한 뒤<br>관리 권한이 있는 서버만 표시됩니다.</p><a class="btn" href="' + html.escape(auth_url, quote=True) + '">Discord로 계속하기</a><div class="small">DinoBot · Secure Dashboard</div></main></div>'
         return page(body, "DinoBot · 로그인")
@@ -94,7 +92,7 @@ def install(core) -> None:
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot Control Center</div><h1 class="title">인증 설정을 확인해주세요.</h1><p class="desc">Discord OAuth 환경변수가 올바르게 설정되지 않았습니다.</p></main></div>', "DinoBot · 설정 오류")
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                token_resp = await client.post("https://discord.com/api/oauth2/token", data={"client_id": client_id,"client_secret": client_secret,"grant_type": "authorization_code","code": code,"redirect_uri": redirect_uri}, headers={"Content-Type": "application/x-www-form-urlencoded"})
+                token_resp = await client.post("https://discord.com/api/oauth2/token", data={"client_id": client_id,"client_secret": client_secret,"grant_type": "authorization_code","code": code,"redirect_uri": REDIRECT_URI}, headers={"Content-Type": "application/x-www-form-urlencoded"})
                 token_resp.raise_for_status()
                 token = token_resp.json()
                 me_resp = await client.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {token['access_token']}"})
