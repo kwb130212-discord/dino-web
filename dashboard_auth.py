@@ -20,10 +20,13 @@ def install(core) -> None:
 
     client_id = os.getenv("DISCORD_CLIENT_ID", "")
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "")
+    # Use the single REDIRECT_URI environment variable everywhere.
+    # Keep the production callback as the safe fallback so Render works even
+    # before the environment variable is configured.
     redirect_uri = os.getenv(
-        "DASHBOARD_REDIRECT_URI",
+        "REDIRECT_URI",
         "https://dino-web-2trw.onrender.com/dashboard/callback",
-    )
+    ).strip()
     support_url = os.getenv("SUPPORT_SERVER_URL", "https://discord.gg/UPEpr7fX")
     invite_url = os.getenv("DISCORD_BOT_INVITE_URL", "")
     if not invite_url and client_id:
