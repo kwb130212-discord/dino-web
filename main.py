@@ -8,6 +8,7 @@ import os
 import uvicorn
 import core
 from startup_fixes import install as install_startup_fixes
+from web_entry import install as install_web_entry
 from dashboard_auth import install as install_dashboard_auth
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
@@ -17,6 +18,8 @@ from dashboard_shortcuts import install as install_dashboard_shortcuts
 
 # Must run before feature routes/queries touch legacy PostgreSQL installations.
 install_startup_fixes(core)
+# Public home/login aliases are installed first; OAuth routes are installed next.
+install_web_entry(core)
 # Stable authentication UI is installed before the management UI.
 install_dashboard_auth(core)
 install_control_center(core)
