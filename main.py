@@ -1451,6 +1451,21 @@ class OwnerPrefixCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    @commands.command(name="서버등록")
+    async def reg_srv(self, ctx: commands.Context, gid: str = None):
+        """봇 주인 전용: 만료일 없는 영구 플래티넘 라이센스로 강제 등록 (결제/체험판 시스템을 우회하는 강력한 명령어라 오너만 사용 가능)"""
+        if not ctx.guild:
+            return
+        if not await self.bot.is_owner(ctx.author):
+            return
+        tgt = int(gid) if gid else ctx.guild.id
+        await DB.execute("""
+            INSERT INTO registered_guilds (guild_id, registered_by, registered_at, expires_at, tier)
+            VALUES (%s, %s, %s, NULL, 'platinum')
+            ON CONFLICT (guild_id) DO UPDATE SET expires_at = NULL, tier = 'platinum'
+        """, tgt, ctx.author.id, now_kst_str())
+        await ctx.send(f"✅ 서버({tgt})를 **영구 만료 없음 · 🏆 플래티넘** 라이센스로 강제 등록했습니다.")
+
     @commands.command(name="강제동기화")
     async def force_sync(self, ctx: commands.Context):
         if not ctx.guild:
@@ -1770,6 +1785,11 @@ async def callback(request: Request, code: str, state: Optional[str] = None):
 
         user_id = user_data.get("id")
         username = user_data.get("username", "알 수 없음")
+        avatar = user_data.get("avatar")
+        avatar_url = (
+            f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png"
+            if avatar and user_id else "https://cdn.discordapp.com/embed/avatars/0.png"
+        )
 
         guild_id_int = int(state) if state and state.isdigit() else None
 
@@ -1780,7 +1800,63 @@ async def callback(request: Request, code: str, state: Optional[str] = None):
                 guild_id_int, int(user_id), access_token, refresh_token
             )
 
-    return HTMLResponse(content=f"<html><body><h2>✅ {username}님, 인증이 완벽하게 처리되었습니다!</h2></body></html>")
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <title>디스코드 통합 인증 완료 [DinoBot Service]</title>
+        <style>
+            * {{ box-sizing: border-box; }}
+            body {{
+                background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+                color: #f8fafc;
+                font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif;
+                display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;
+            }}
+            .card {{
+                background: rgba(30, 41, 59, 0.85);
+                backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                padding: 60px 50px; border-radius: 32px; text-align: center;
+                box-shadow: 0 30px 60px rgba(0, 0, 0, 0.7); width: 540px; max-width: 90vw;
+                animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+            }}
+            @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+            .profile-img {{
+                width: 100px; height: 100px; border-radius: 50%; border: 4px solid #38bdf8;
+                margin: 0 auto 20px auto; object-fit: cover; box-shadow: 0 0 30px rgba(56, 189, 248, 0.6);
+            }}
+            .icon-badge {{
+                width: 40px; height: 40px; background-color: #22c55e; color: #ffffff; border-radius: 50%;
+                display: flex; justify-content: center; align-items: center;
+                margin: -40px auto 20px auto; font-size: 18px; font-weight: bold;
+                border: 3px solid #1e293b; position: relative; z-index: 2;
+            }}
+            h2 {{ margin: 0 0 12px 0; font-size: 30px; font-weight: 700; letter-spacing: -0.5px; }}
+            .username-highlight {{ color: #38bdf8; }}
+            p {{ color: #94a3b8; font-size: 17px; line-height: 1.6; margin: 0 0 35px 0; }}
+            .btn-close {{
+                background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%); color: #ffffff; border: none;
+                padding: 16px 32px; font-size: 17px; font-weight: 600; border-radius: 16px; cursor: pointer;
+                transition: transform 0.2s, box-shadow 0.2s; width: 100%; box-shadow: 0 8px 20px rgba(56, 189, 248, 0.4);
+            }}
+            .btn-close:hover {{ transform: translateY(-2px); box-shadow: 0 10px 24px rgba(56, 189, 248, 0.5); }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <img src="{avatar_url}" alt="프로필" class="profile-img">
+            <div class="icon-badge">✓</div>
+            <h2><span class="username-highlight">{username}</span>님</h2>
+            <h2>인증이 완료되었습니다!</h2>
+            <p>디스코드 서버로 돌아가면<br>정상적으로 권한과 혜택이 적용됩니다.</p>
+            <button class="btn-close" onclick="window.close()">창 닫기</button>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 # ==============================================================================
 # 8. 웹 대시보드 (디스코드 OAuth 로그인, 봇 관리자 전용, 전체 정보 표시)
