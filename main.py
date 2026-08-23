@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """DinoBot production entrypoint.
 
-The original implementation is preserved in legacy_main.py. This wrapper adds the
-Control Center, user tutorial/audit logs, and configurable ticket controls without
-duplicating the bot, DB pool, OAuth or legacy event handlers.
+legacy_main.py remains the compatibility/core layer. Feature modules are additive
+and keep their state in PostgreSQL so deploys and source-code updates are non-destructive.
 """
 import os
 import uvicorn
@@ -11,10 +10,12 @@ import legacy_main as core
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
+from persistent_settings import install as install_persistent_settings
 
 install_control_center(core)
 install_tutorial_logs(core)
 install_ticket_control(core)
+install_persistent_settings(core)
 
 app = core.app
 bot = core.bot
