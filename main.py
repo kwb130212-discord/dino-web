@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """DinoBot production entrypoint.
 
-legacy_main.py remains the compatibility/core layer. Feature modules are additive
-and keep their state in PostgreSQL so deploys and source-code updates are non-destructive.
+The former legacy core is preserved as ``core.py``. Feature modules are additive
+and keep persistent state in PostgreSQL, so code deployments do not reset data.
 """
 import os
 import uvicorn
-import legacy_main as core
+import core
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
