@@ -7,12 +7,15 @@ state remains in PostgreSQL so code deployments do not reset server data.
 import os
 import uvicorn
 import core
+from startup_fixes import install as install_startup_fixes
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
 from persistent_settings import install as install_persistent_settings
 from dashboard_shortcuts import install as install_dashboard_shortcuts
 
+# Must run before feature routes/queries touch legacy PostgreSQL installations.
+install_startup_fixes(core)
 install_control_center(core)
 install_tutorial_logs(core)
 install_ticket_control(core)
