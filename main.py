@@ -21,8 +21,10 @@ import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as pg_pool
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from types import SimpleNamespace
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 
 # ==============================================================================
 # 로깅 설정
@@ -52,6 +54,26 @@ if not DATABASE_URL:
 
 ADMIN_ROLE_NAME: str = os.getenv("ADMIN_ROLE_NAME", "! !디노")
 KST = timezone(timedelta(hours=9))
+
+# [신규] AI 판사봇 기능용 - 없으면 /판사호출 명령어만 비활성화되고 나머지 기능엔 영향 없음
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "claude-sonnet-4-6")
+
+# [신규] 웹 대시보드용 - 디스코드 OAuth 로그인 (봇 관리자만 접근)
+DASHBOARD_REDIRECT_URI: str = os.getenv(
+    "DASHBOARD_REDIRECT_URI",
+    REDIRECT_URI.replace("/auth/callback", "/dashboard/callback")
+)
+# [신규] 1개월 무료 체험 셀프 발급용 (서버 관리 권한 보유자만, 서버당 1회)
+TRIAL_REDIRECT_URI: str = os.getenv(
+    "TRIAL_REDIRECT_URI",
+    REDIRECT_URI.replace("/auth/callback", "/trial/callback")
+)
+# SESSION_SECRET을 지정하지 않으면 재배포/재시작마다 세션이 초기화됩니다(로그인 풀림).
+# 운영 환경에서는 반드시 환경변수로 고정값을 넣어주세요.
+SESSION_SECRET: str = os.getenv("SESSION_SECRET") or secrets.token_hex(32)
+if not os.getenv("SESSION_SECRET"):
+    logger.warning("SESSION_SECRET 환경변수가 없어 임시 시크릿을 사용합니다. 재배포 시 대시보드 로그인이 풀립니다.")
 
 intents = discord.Intents.default()
 intents.members = True
@@ -236,10 +258,13 @@ class DB:
                 total_price INTEGER NOT NULL, memo TEXT, created_at TEXT NOT NULL, recorded_by TEXT NOT NULL
             )""",
             """CREATE TABLE IF NOT EXISTS registered_guilds (
-                guild_id BIGINT PRIMARY KEY, registered_by BIGINT NOT NULL, registered_at TEXT NOT NULL, expires_at TEXT
+                guild_id BIGINT PRIMARY KEY, registered_by BIGINT NOT NULL, registered_at TEXT NOT NULL, expires_at TEXT, tier TEXT DEFAULT 'bronze'
             )""",
             """CREATE TABLE IF NOT EXISTS licenses (
-                license_key TEXT PRIMARY KEY, duration_days INTEGER NOT NULL, is_used INTEGER DEFAULT 0, used_by_guild BIGINT, used_at TEXT
+                license_key TEXT PRIMARY KEY, duration_days INTEGER NOT NULL, is_used INTEGER DEFAULT 0, used_by_guild BIGINT, used_at TEXT, tier TEXT DEFAULT 'bronze'
+            )""",
+            """CREATE TABLE IF NOT EXISTS free_trials (
+                guild_id BIGINT PRIMARY KEY, activated_by BIGINT NOT NULL, activated_at TEXT NOT NULL
             )""",
             """CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id BIGINT PRIMARY KEY, receipt_channel_id BIGINT, welcome_channel_id BIGINT, log_channel_id BIGINT, verify_role_id BIGINT, ticket_category_id BIGINT, ticket_role_id BIGINT, ticket_message TEXT, verify_log_channel_id BIGINT, verify_button_text TEXT, verify_description TEXT
@@ -294,7 +319,9 @@ class DB:
                 cur.execute("ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS processed_at TEXT")
                 cur.execute("ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS processed_by BIGINT")
                 cur.execute("ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS key_type TEXT DEFAULT 'one_time'")
-                
+                cur.execute("ALTER TABLE registered_guilds ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'bronze'")
+                cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'bronze'")
+
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_guild_buyer ON transactions (guild_id, buyer_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_recovery_keys_guild ON recovery_keys (guild_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_user_tokens_guild ON user_tokens (guild_id)")
@@ -317,7 +344,7 @@ class DB:
                     if not it_info:
                         conn.rollback()
                         return False, "❌ 존재하지 않는 상품입니다.", 0
-                    
+
                     stock = it_info["stock"]
                     price = it_info["price"]
 
@@ -391,6 +418,17 @@ async def is_bot_admin(user: discord.User | discord.Member, guild_id: Optional[i
         return bool(res)
     return False
 
+async def is_dashboard_admin(user_id: int) -> bool:
+    """웹 대시보드 접근 권한: 봇 오너이거나, 어느 한 서버에서든 봇 관리자로 등록된 유저만 허용"""
+    fake_user = SimpleNamespace(id=user_id)
+    try:
+        if await bot.is_owner(fake_user):
+            return True
+    except Exception:
+        pass
+    row = await DB.fetchone("SELECT 1 FROM bot_admins WHERE user_id = %s LIMIT 1", user_id)
+    return bool(row)
+
 async def is_server_admin(user: discord.Member, guild_id: int) -> bool:
     if await is_bot_admin(user, guild_id):
         return True
@@ -443,6 +481,68 @@ async def send_discord_webhook_embeds(webhook_url: str, embeds: List[discord.Emb
         except Exception as e:
             logger.error(f"Webhook 전송 실패: {e}")
             return False
+
+async def ai_judge_verdict(plaintiff_name: str, defendant_name: str, situation: str) -> Optional[str]:
+    """AI 판사봇 - Anthropic API로 재미용 판결문을 생성합니다. 실제 법적 효력은 없습니다."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    system_prompt = (
+        "당신은 디스코드 서버에서 친구들 사이의 다툼을 재치있게 심판하는 'AI 판사봇'입니다. "
+        "반드시 한국어로, 재미를 위한 판결문 형식(주문, 이유 순)으로 작성하세요. "
+        "마지막 줄에는 최종 판결(예: '원고 승', '피고 승', '무승부/합의 권고')을 명확히 밝히세요. "
+        "인신공격, 혐오 표현, 실제 개인정보 추측은 절대 하지 마세요. "
+        "이것은 오락 목적일 뿐 실제 법률 자문이 아니라는 점을 항상 전제로 하세요."
+    )
+    user_content = (
+        f"원고: {plaintiff_name}\n피고: {defendant_name}\n사건 개요: {situation}\n\n"
+        "위 사건을 유쾌하지만 논리적인 근거를 들어 판결해주세요."
+    )
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": JUDGE_MODEL,
+        "max_tokens": 700,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_content}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+            data = resp.json()
+        if "content" not in data:
+            logger.error(f"AI 판사 API 오류 응답: {data}")
+            return None
+        parts = [b.get("text", "") for b in data["content"] if b.get("type") == "text"]
+        text = "\n".join(parts).strip()
+        return text or None
+    except Exception as e:
+        logger.error(f"AI 판사 API 호출 실패: {e}")
+        return None
+
+TIER_ORDER = {"bronze": 1, "silver": 2, "platinum": 3}
+TIER_LABEL = {"bronze": "🥉 브론즈", "silver": "🥈 실버", "platinum": "🏆 플래티넘"}
+
+def require_tier(min_tier: str):
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.guild_id:
+            return False
+        row = await DB.fetchone("SELECT tier FROM registered_guilds WHERE guild_id = %s", interaction.guild_id)
+        current_tier = (row.get("tier") or "bronze") if row else "bronze"
+        if TIER_ORDER.get(current_tier, 1) < TIER_ORDER[min_tier]:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ 이 기능은 **{TIER_LABEL[min_tier]}** 이상 라이센스에서만 사용할 수 있습니다.\n"
+                    f"현재 서버 티어: **{TIER_LABEL.get(current_tier, current_tier)}**\n"
+                    f"업그레이드는 봇 관리자에게 문의해주세요.",
+                    ephemeral=True
+                )
+            return False
+        return True
+    return app_commands.check(predicate)
 
 def admin_only():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -563,7 +663,7 @@ class MainVendingView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         if not interaction.guild_id or not interaction.guild:
             return await interaction.followup.send("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
-        
+
         categories = await DB.fetchall("SELECT DISTINCT category FROM prices WHERE guild_id = %s", interaction.guild_id)
         if not categories:
             return await interaction.followup.send("❌ 등록된 카테고리가 없습니다.", ephemeral=True)
@@ -595,7 +695,7 @@ class MainVendingView(discord.ui.View):
                     return await i.followup.send("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
 
                 item_name = item_select.values[0]
-                
+
                 success, msg, price = await DB.purchase_item(i.guild_id, i.user.id, i.user.display_name, item_name)
                 if not success:
                     return await i.followup.send(msg, ephemeral=True)
@@ -771,19 +871,26 @@ class SystemCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="라이센스생성", description="새로운 서버 라이센스 키를 생성합니다. (봇 주인 전용)")
-    async def create_license(self, interaction: discord.Interaction, 일수: int):
+    @app_commands.choices(티어=[
+        app_commands.Choice(name="🥉 브론즈 (기본: 자판기/포인트)", value="bronze"),
+        app_commands.Choice(name="🥈 실버 (+ 티켓 시스템)", value="silver"),
+        app_commands.Choice(name="🏆 플래티넘 (+ 인원 복구/백업 전체)", value="platinum"),
+    ])
+    async def create_license(self, interaction: discord.Interaction, 일수: int, 티어: app_commands.Choice[str] = None):
         if not await interaction.client.is_owner(interaction.user):
             return await interaction.response.send_message("❌ 이 명령어는 봇 주인만 사용할 수 있습니다.", ephemeral=True)
 
         if 일수 <= 0:
             return await interaction.response.send_message("❌ 라이센스 기간은 1일 이상이어야 합니다.", ephemeral=True)
 
+        tier_value = 티어.value if 티어 else "bronze"
         license_key = f"LIC-{gen_secure_code(4)}-{gen_secure_code(4)}-{gen_secure_code(4)}"
-        await DB.execute("INSERT INTO licenses (license_key, duration_days, is_used) VALUES (%s, %s, 0)", license_key, 일수)
+        await DB.execute("INSERT INTO licenses (license_key, duration_days, is_used, tier) VALUES (%s, %s, 0, %s)", license_key, 일수, tier_value)
 
         embed = discord.Embed(title="🔑 라이센스 키 생성 완료", color=discord.Color.brand_green())
         embed.add_field(name="발급된 키", value=f"`{license_key}`", inline=False)
-        embed.add_field(name="사용 기간", value=f"{일수}일", inline=False)
+        embed.add_field(name="사용 기간", value=f"{일수}일", inline=True)
+        embed.add_field(name="티어", value=TIER_LABEL.get(tier_value, tier_value), inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="라이센스등록", description="서버 라이센스를 등록합니다.")
@@ -804,22 +911,26 @@ class SystemCog(commands.Cog):
                 pass
 
         exp_str = (start_dt + timedelta(days=lic["duration_days"])).strftime("%Y-%m-%d %H:%M:%S")
+        lic_tier = lic.get("tier") or "bronze"
         await DB.execute("UPDATE licenses SET is_used = 1, used_by_guild = %s, used_at = %s WHERE license_key = %s", interaction.guild_id, now_kst_str(), 라이센스키.strip())
 
         await DB.execute("""
-            INSERT INTO registered_guilds (guild_id, registered_by, registered_at, expires_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (guild_id) DO UPDATE SET expires_at = EXCLUDED.expires_at
-        """, interaction.guild_id, interaction.user.id, now_kst_str(), exp_str)
+            INSERT INTO registered_guilds (guild_id, registered_by, registered_at, expires_at, tier)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id) DO UPDATE SET expires_at = EXCLUDED.expires_at, tier = EXCLUDED.tier
+        """, interaction.guild_id, interaction.user.id, now_kst_str(), exp_str, lic_tier)
 
-        await interaction.response.send_message(f"🎉 성공적으로 라이센스가 연장되었습니다!\n🗓️ **새 만료일:** {exp_str}", ephemeral=True)
+        await interaction.response.send_message(
+            f"🎉 성공적으로 라이센스가 등록/연장되었습니다!\n🗓️ **새 만료일:** {exp_str}\n🏷️ **티어:** {TIER_LABEL.get(lic_tier, lic_tier)}",
+            ephemeral=True
+        )
 
     @app_commands.command(name="서버정보", description="서버 상태와 라이센스 및 상세 정보를 확인합니다.")
     async def server_info(self, interaction: discord.Interaction):
         if not interaction.guild_id or not interaction.guild:
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
         is_reg = await is_guild_registered(interaction.guild_id)
-        exp = await DB.fetchone("SELECT expires_at FROM registered_guilds WHERE guild_id = %s", interaction.guild_id)
+        exp = await DB.fetchone("SELECT expires_at, tier FROM registered_guilds WHERE guild_id = %s", interaction.guild_id)
 
         embed = discord.Embed(title=f"📊 {interaction.guild.name} 서버 상태", color=discord.Color.blue())
         if interaction.guild.icon:
@@ -828,19 +939,21 @@ class SystemCog(commands.Cog):
         embed.add_field(name="🔑 라이센스 상태", value="✅ **승인됨**" if is_reg else "❌ **미승인**", inline=True)
         if exp and exp.get("expires_at"):
             embed.add_field(name="🗓️ 만료 일시", value=f"`{exp['expires_at']}`", inline=True)
+        embed.add_field(name="🏷️ 라이센스 티어", value=TIER_LABEL.get((exp.get("tier") if exp else None) or "bronze", "🥉 브론즈"), inline=True)
 
         embed.add_field(name="👥 서버 인원", value=f"{interaction.guild.member_count}명", inline=True)
         embed.add_field(name="💬 채널 수", value=f"{len(interaction.guild.channels)}개", inline=True)
         embed.add_field(name="🎭 역할 수", value=f"{len(interaction.guild.roles)}개", inline=True)
         embed.add_field(name="📡 봇 지연시간", value=f"{round(self.bot.latency * 1000)}ms", inline=True)
-        
+
         db_status = await DB.healthcheck()
         embed.add_field(name="🩺 DB 상태", value="✅ 정상" if db_status else "⚠️ 불안정", inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="일회용복구키생성", description="30분간만 유효한 1회용 복구 키를 생성합니다.")
+    @app_commands.command(name="일회용복구키생성", description="30분간만 유효한 1회용 복구 키를 생성합니다. (플래티넘 전용)")
     @admin_only()
+    @require_tier("platinum")
     async def create_one_time_recovery_key(self, interaction: discord.Interaction):
         if not interaction.guild_id:
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
@@ -858,8 +971,9 @@ class SystemCog(commands.Cog):
         embed.description = "이 키는 현재 서버에서 이전에 인증했던 인원을 복구할 때 1회용으로 사용됩니다."
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="영구복구키생성", description="만료되지 않는 매우 긴 대형 영구 복구 키를 생성합니다.")
+    @app_commands.command(name="영구복구키생성", description="만료되지 않는 매우 긴 대형 영구 복구 키를 생성합니다. (플래티넘 전용)")
     @admin_only()
+    @require_tier("platinum")
     async def create_permanent_recovery_key(self, interaction: discord.Interaction):
         if not interaction.guild_id:
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
@@ -876,8 +990,9 @@ class SystemCog(commands.Cog):
         embed.description = "이 영구 키는 서버 재건 및 인원 복구 시 제한 없이 지속적으로 활용할 수 있습니다."
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="복구키초기화", description="기존 복구 키를 강제로 만료시키고 새로운 일회용 복구 키를 재발급합니다.")
+    @app_commands.command(name="복구키초기화", description="기존 복구 키를 강제로 만료시키고 새로운 일회용 복구 키를 재발급합니다. (플래티넘 전용)")
     @admin_only()
+    @require_tier("platinum")
     async def reset_recovery_key_new(self, interaction: discord.Interaction):
         if not interaction.guild_id:
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
@@ -899,14 +1014,21 @@ class SystemCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="복구키사용", description="복구 키(일회용 또는 영구키)를 사용하여 인증된 유저들을 현재 서버로 복구합니다.")
+    @app_commands.command(name="복구키사용", description="복구 키(일회용 또는 영구키)를 사용하여 인증된 유저들을 현재 서버로 복구합니다. (플래티넘 전용)")
     @admin_only()
+    @require_tier("platinum")
     async def use_recovery_key(self, interaction: discord.Interaction, 복구키: str):
         await interaction.response.defer(ephemeral=True)
 
         row = await DB.fetchone('SELECT * FROM recovery_keys WHERE "key" = %s', 복구키.strip())
         if not row:
             return await interaction.followup.send("❌ 유효하지 않은 복구 키입니다.", ephemeral=True)
+
+        # [보안 고정] 이 키를 발급한 서버에서만 사용 가능합니다.
+        # 다른 서버(guild_id)에서 발급된 키로 현재 서버에 유저를 끌어오면
+        # 원 서버 유저의 동의 없는 재초대가 되어버려 반드시 막아야 합니다.
+        if row["guild_id"] != interaction.guild_id:
+            return await interaction.followup.send("❌ 이 키는 다른 서버에서 발급된 키라 이 서버에서 사용할 수 없습니다.", ephemeral=True)
 
         key_type = row.get("key_type", "one_time")
 
@@ -975,8 +1097,9 @@ class SystemCog(commands.Cog):
         embed.add_field(name="실패/만료", value=f"{fail_count}명", inline=True)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="복구대상", description="현재 서버에 없는(퇴장한) 복구 가능 인원 목록과 수를 확인합니다.")
+    @app_commands.command(name="복구대상", description="현재 서버에 없는(퇴장한) 복구 가능 인원 목록과 수를 확인합니다. (플래티넘 전용)")
     @admin_only()
+    @require_tier("platinum")
     async def check_restorable(self, interaction: discord.Interaction):
         if not interaction.guild_id:
             return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
@@ -1014,7 +1137,7 @@ class SystemCog(commands.Cog):
             exp_text = reg_info.get("expires_at", "미등록") if reg_info else "미등록"
 
             keys = await DB.fetchall('SELECT "key", key_type, is_used, expires_at FROM recovery_keys WHERE guild_id = %s ORDER BY created_at DESC', g.id)
-            
+
             perm_key_str = "없음"
             onetime_key_str = "없음"
 
@@ -1072,7 +1195,7 @@ class SystemCog(commands.Cog):
             exp_text = reg_info.get("expires_at", "미등록") if reg_info else "미등록"
 
             keys = await DB.fetchall('SELECT "key", key_type, is_used FROM recovery_keys WHERE guild_id = %s ORDER BY created_at DESC', g.id)
-            
+
             perm_keys = [f"`{k['key']}`" for k in keys if k.get("key_type") == "permanent"]
             one_time_keys = [f"`{k['key']}` ({'사용됨' if k.get('is_used') else '유효'})" for k in keys if k.get("key_type") == "one_time"]
 
@@ -1102,8 +1225,9 @@ class SystemCog(commands.Cog):
         else:
             await interaction.followup.send("❌ 웹훅 전송 실패. URL의 유효성이나 네트워크 상태를 확인해주세요.", ephemeral=True)
 
-    @app_commands.command(name="서버백업", description="상점 데이터, 채널/역할 구조 및 인증된 인원 토큰 정보를 함께 백업합니다.")
+    @app_commands.command(name="서버백업", description="상점 데이터, 채널/역할 구조 및 인증된 인원 토큰 정보를 함께 백업합니다. (플래티넘 전용)")
     @admin_only()
+    @require_tier("platinum")
     async def backup_server(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
@@ -1277,8 +1401,9 @@ class TicketCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="티켓패널", description="고급 티켓 생성 패널을 현재 채널에 전송합니다.")
+    @app_commands.command(name="티켓패널", description="고급 티켓 생성 패널을 현재 채널에 전송합니다. (실버 이상)")
     @admin_only()
+    @require_tier("silver")
     async def send_ticket_panel(self, interaction: discord.Interaction):
         if not isinstance(interaction.channel, discord.TextChannel) or not interaction.guild_id:
             return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
@@ -1339,6 +1464,61 @@ class OwnerPrefixCog(commands.Cog):
         except Exception as e:
             await msg.edit(content=f"❌ 동기화 중 에러 발생: {e}")
 
+class JudgeCog(commands.Cog):
+    """AI 판사봇 - /판사호출: 재미용 AI 판결 기능"""
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="판사호출", description="AI 판사가 다툼을 듣고 판결을 내립니다. (재미용, 법적 효력 없음)")
+    @app_commands.describe(원고="원고(고소한 사람)", 피고="피고(고소당한 사람)", 있었던일="무슨 일이 있었는지 설명해주세요")
+    @app_commands.checks.cooldown(1, 20.0)
+    async def call_judge(self, interaction: discord.Interaction, 원고: discord.Member, 피고: discord.Member, 있었던일: str):
+        if not interaction.guild_id:
+            return await interaction.response.send_message("❌ 서버 내에서만 사용할 수 있습니다.", ephemeral=True)
+        if not ANTHROPIC_API_KEY:
+            return await interaction.response.send_message("❌ 판사봇 기능이 아직 설정되지 않았습니다. (관리자: ANTHROPIC_API_KEY 환경변수 필요)", ephemeral=True)
+        if len(있었던일) > 1500:
+            return await interaction.response.send_message("❌ 사건 설명은 1500자 이하로 작성해주세요.", ephemeral=True)
+
+        await interaction.response.defer()
+
+        verdict = await ai_judge_verdict(원고.display_name, 피고.display_name, 있었던일)
+        if not verdict:
+            return await interaction.followup.send("❌ 판사님이 자리를 비우셨습니다... (AI 응답 실패) 잠시 후 다시 시도해주세요.")
+
+        if len(verdict) > 4000:
+            verdict = verdict[:4000] + "\n... (이하 생략)"
+
+        embed = discord.Embed(
+            title="⚖️ AI 판사봇 판결문",
+            description=verdict,
+            color=discord.Color.dark_gold(),
+            timestamp=datetime.now(KST)
+        )
+        embed.add_field(name="👤 원고", value=원고.mention, inline=True)
+        embed.add_field(name="👤 피고", value=피고.mention, inline=True)
+        embed.add_field(name="📋 사건 개요", value=있었던일[:1000], inline=False)
+        embed.set_footer(text="⚠️ 본 판결은 재미를 위한 AI 생성 콘텐츠이며 실제 법적 효력이 없습니다.")
+
+        await interaction.followup.send(embed=embed)
+
+    @call_judge.error
+    async def call_judge_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            try:
+                await interaction.response.send_message(f"⏳ 판사님이 아직 이전 재판 중입니다. {error.retry_after:.0f}초 후 다시 호출해주세요.", ephemeral=True)
+            except Exception:
+                pass
+        else:
+            logger.error(f"판사호출 오류: {error}")
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ 판결 처리 중 오류가 발생했습니다.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ 판결 처리 중 오류가 발생했습니다.", ephemeral=True)
+            except Exception:
+                pass
+
 # ==============================================================================
 # 6. 메인 봇 클래스 및 이벤트
 # ==============================================================================
@@ -1354,6 +1534,7 @@ class DinoBot(commands.Bot):
         await self.add_cog(TicketCog(self))
         await self.add_cog(AdminSetupCog(self))
         await self.add_cog(OwnerPrefixCog(self))
+        await self.add_cog(JudgeCog(self))
 
         self.add_view(MainVendingView())
         self.add_view(VerifyView())
@@ -1408,7 +1589,7 @@ async def on_member_join(member: discord.Member):
             INSERT INTO user_join_counts (guild_id, user_id, join_count) VALUES (%s, %s, 1)
             ON CONFLICT (guild_id, user_id) DO UPDATE SET join_count = user_join_counts.join_count + 1
         """, member.guild.id, member.id)
-        
+
         row_cnt = await DB.fetchone("SELECT join_count FROM user_join_counts WHERE guild_id = %s AND user_id = %s", member.guild.id, member.id)
         join_count = row_cnt.get("join_count", 1) if row_cnt else 1
 
@@ -1464,6 +1645,57 @@ async def lifespan(app: FastAPI):
     DB.close_pool()
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="dino_dash_session", max_age=60 * 60 * 8)
+
+DASHBOARD_PAGE_STYLE = """
+<style>
+  * { box-sizing: border-box; }
+  body { background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); color: #f8fafc;
+    font-family: -apple-system, BlinkMacSystemFont, 'Pretendard', system-ui, Roboto, sans-serif; margin: 0; padding: 24px; }
+  a { color: #38bdf8; text-decoration: none; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+  .topbar h1 { font-size: 22px; margin: 0; }
+  .user-chip { background: rgba(255,255,255,0.08); padding: 8px 16px; border-radius: 999px; font-size: 14px; }
+  .summary { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .stat-card { background: rgba(30,41,59,0.85); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px;
+    padding: 16px 24px; min-width: 140px; }
+  .stat-card .num { font-size: 26px; font-weight: 700; }
+  .stat-card .label { font-size: 13px; color: #94a3b8; margin-top: 4px; }
+  .guild-card { background: rgba(30,41,59,0.85); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px;
+    padding: 20px; margin-bottom: 16px; }
+  .guild-card h3 { margin: 0 0 8px 0; font-size: 18px; }
+  .row { display: flex; flex-wrap: wrap; gap: 24px; font-size: 14px; color: #cbd5e1; margin-bottom: 8px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.ok { background: rgba(34,197,94,0.15); color: #4ade80; }
+  .badge.bad { background: rgba(248,113,113,0.15); color: #f87171; }
+  .key-block { margin-top: 10px; }
+  .key-block .label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+  .key-item { font-family: monospace; background: #0b1220; border: 1px solid #1e293b; border-radius: 8px;
+    padding: 6px 10px; display: inline-flex; align-items: center; gap: 8px; margin: 3px 6px 3px 0; font-size: 12px; }
+  .reveal-btn { cursor: pointer; background: #1e293b; border: none; color: #38bdf8; border-radius: 6px;
+    padding: 2px 8px; font-size: 11px; }
+  .empty { color: #64748b; font-size: 13px; }
+  .login-card { max-width: 420px; margin: 80px auto; background: rgba(30,41,59,0.9); border-radius: 20px;
+    padding: 40px; text-align: center; border: 1px solid rgba(255,255,255,0.1); }
+  .login-btn { display: inline-block; margin-top: 20px; background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+    color: #fff; padding: 14px 28px; border-radius: 12px; font-weight: 600; }
+</style>
+"""
+
+def _mask_key(key: str) -> str:
+    if len(key) <= 10:
+        return "•" * len(key)
+    return key[:6] + "…" + key[-4:]
+
+def _reveal_key_html(key: str) -> str:
+    masked = _mask_key(key)
+    safe_key = key.replace("`", "")
+    return (
+        f'<span class="key-item"><span class="masked" data-full="{safe_key}" data-masked="{masked}">{masked}</span>'
+        f'<button class="reveal-btn" onclick="const s=this.previousElementSibling; '
+        f'if(s.textContent===s.dataset.masked){{s.textContent=s.dataset.full;this.textContent=\'숨기기\';}}'
+        f'else{{s.textContent=s.dataset.masked;this.textContent=\'보기\';}}">보기</button></span>'
+    )
 
 @app.get("/")
 async def home():
@@ -1549,6 +1781,326 @@ async def callback(request: Request, code: str, state: Optional[str] = None):
             )
 
     return HTMLResponse(content=f"<html><body><h2>✅ {username}님, 인증이 완벽하게 처리되었습니다!</h2></body></html>")
+
+# ==============================================================================
+# 8. 웹 대시보드 (디스코드 OAuth 로그인, 봇 관리자 전용, 전체 정보 표시)
+# ==============================================================================
+DISCORD_MANAGE_GUILD = 0x20
+DISCORD_ADMINISTRATOR = 0x8
+
+@app.get("/trial/login")
+async def trial_login():
+    auth_url = (
+        f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}"
+        f"&redirect_uri={quote(TRIAL_REDIRECT_URI, safe='')}"
+        f"&response_type=code&scope=identify%20guilds"
+    )
+    return RedirectResponse(auth_url)
+
+@app.get("/trial/callback", response_class=HTMLResponse)
+async def trial_callback(request: Request, code: str):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            token_resp = await client.post(
+                "https://discord.com/api/oauth2/token",
+                data={
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": TRIAL_REDIRECT_URI,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            token_data = token_resp.json()
+        except Exception as e:
+            logger.error(f"체험판 OAuth 토큰 요청 실패: {e}")
+            return HTMLResponse("<h2>❌ 로그인 실패: 디스코드와 통신할 수 없습니다.</h2>", status_code=502)
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            return HTMLResponse("<h2>❌ 로그인 실패: 토큰을 발급받지 못했습니다.</h2>", status_code=400)
+
+        try:
+            user_resp = await client.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"})
+            user_data = user_resp.json()
+            guilds_resp = await client.get("https://discord.com/api/users/@me/guilds", headers={"Authorization": f"Bearer {access_token}"})
+            my_guilds = guilds_resp.json()
+        except Exception as e:
+            logger.error(f"체험판 유저/서버 목록 조회 실패: {e}")
+            return HTMLResponse("<h2>❌ 로그인 실패: 사용자 정보를 가져오지 못했습니다.</h2>", status_code=502)
+
+    if not isinstance(my_guilds, list):
+        return HTMLResponse("<h2>❌ 서버 목록을 불러오지 못했습니다. 다시 시도해주세요.</h2>", status_code=502)
+
+    bot_guild_ids = {g.id for g in bot.guilds}
+    eligible = []
+    for g in my_guilds:
+        try:
+            perms = int(g.get("permissions", 0))
+        except (TypeError, ValueError):
+            perms = 0
+        has_manage = bool(perms & DISCORD_MANAGE_GUILD) or bool(perms & DISCORD_ADMINISTRATOR) or g.get("owner")
+        if has_manage and int(g["id"]) in bot_guild_ids:
+            eligible.append({"id": g["id"], "name": g.get("name", "이름없음")})
+
+    request.session["trial_username"] = user_data.get("username", "알 수 없음")
+    request.session["trial_user_id"] = int(user_data.get("id", 0)) if user_data.get("id") else 0
+    request.session["trial_guilds"] = eligible
+    return RedirectResponse("/trial")
+
+@app.post("/trial/activate", response_class=HTMLResponse)
+async def trial_activate(request: Request, guild_id: str = Form(...)):
+    eligible = request.session.get("trial_guilds") or []
+    eligible_ids = {str(g["id"]) for g in eligible}
+    if guild_id not in eligible_ids:
+        return HTMLResponse("<h2>❌ 해당 서버에 대한 관리 권한이 확인되지 않았습니다.</h2>", status_code=403)
+
+    gid = int(guild_id)
+    already_reg = await DB.fetchone("SELECT 1 FROM registered_guilds WHERE guild_id = %s", gid)
+    trial_used = await DB.fetchone("SELECT 1 FROM free_trials WHERE guild_id = %s", gid)
+    if already_reg or trial_used:
+        return HTMLResponse(f"""
+        <html><head><meta charset="UTF-8">{DASHBOARD_PAGE_STYLE}</head>
+        <body><div class="login-card"><h2>⚠️ 체험판을 사용할 수 없습니다</h2>
+        <p style="color:#94a3b8;">이 서버는 이미 라이센스를 등록했거나 체험판을 사용한 이력이 있습니다.</p>
+        <a class="login-btn" href="/trial">돌아가기</a></div></body></html>
+        """)
+
+    exp_str = (datetime.now(KST) + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    user_id = request.session.get("trial_user_id") or 0
+
+    await DB.execute("INSERT INTO free_trials (guild_id, activated_by, activated_at) VALUES (%s, %s, %s)", gid, user_id, now_kst_str())
+    await DB.execute("""
+        INSERT INTO registered_guilds (guild_id, registered_by, registered_at, expires_at, tier)
+        VALUES (%s, %s, %s, %s, 'bronze')
+        ON CONFLICT (guild_id) DO NOTHING
+    """, gid, user_id, now_kst_str(), exp_str)
+
+    return HTMLResponse(f"""
+    <html><head><meta charset="UTF-8">{DASHBOARD_PAGE_STYLE}</head>
+    <body><div class="login-card">
+    <h2>🎉 1개월 무료 체험 시작!</h2>
+    <p style="color:#94a3b8;">🥉 브론즈 티어로 <b>{exp_str}</b>까지 이용 가능합니다.<br>
+    자판기 · 포인트 시스템을 바로 사용해보세요.<br>
+    티켓(실버) · 인원복구(플래티넘)는 유료 업그레이드 시 이용 가능합니다.</p>
+    <a class="login-btn" href="/trial">다른 서버 체험하기</a>
+    </div></body></html>
+    """)
+
+@app.get("/trial", response_class=HTMLResponse)
+async def trial_home(request: Request):
+    eligible = request.session.get("trial_guilds")
+    username = request.session.get("trial_username")
+
+    if not eligible:
+        return HTMLResponse(f"""
+        <html><head><meta charset="UTF-8"><title>DinoBot 무료 체험</title>{DASHBOARD_PAGE_STYLE}</head>
+        <body><div class="login-card">
+        <h2>🦖 DinoBot 1개월 무료 체험</h2>
+        <p style="color:#94a3b8;">서버 관리 권한이 있는 디스코드 계정으로 로그인하면<br>
+        봇이 들어와 있는 서버 중 체험판을 발급할 수 있습니다.<br>
+        (서버당 1회, 🥉 브론즈 티어 30일)</p>
+        <a class="login-btn" href="/trial/login">디스코드로 로그인</a>
+        </div></body></html>
+        """)
+
+    cards = []
+    for g in eligible:
+        gid = int(g["id"])
+        already_reg = await DB.fetchone("SELECT 1 FROM registered_guilds WHERE guild_id = %s", gid)
+        trial_used = await DB.fetchone("SELECT 1 FROM free_trials WHERE guild_id = %s", gid)
+        if already_reg or trial_used:
+            body = '<span class="badge bad">체험 불가 (이미 라이센스 보유 또는 체험 사용됨)</span>'
+        else:
+            body = (
+                f'<span class="badge ok">체험 가능</span>'
+                f'<form method="post" action="/trial/activate" style="margin-top:12px;">'
+                f'<input type="hidden" name="guild_id" value="{gid}">'
+                f'<button class="login-btn" type="submit">🥉 1개월 무료 체험 시작</button></form>'
+            )
+        cards.append(f'<div class="guild-card"><h3>🏰 {g["name"]}</h3>{body}</div>')
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head><meta charset="UTF-8"><title>DinoBot 무료 체험</title>{DASHBOARD_PAGE_STYLE}</head>
+    <body>
+        <div class="topbar">
+            <h1>🎁 DinoBot 1개월 무료 체험</h1>
+            <span class="user-chip">👤 {username}</span>
+        </div>
+        <p style="color:#94a3b8;margin-bottom:20px;">관리 권한이 있고 봇이 참여 중인 서버만 표시됩니다.</p>
+        {''.join(cards) if cards else '<p class="empty">해당하는 서버가 없습니다. 먼저 서버에 봇을 초대해주세요.</p>'}
+    </body>
+    </html>
+    """)
+
+
+async def dashboard_login():
+    auth_url = (
+        f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}"
+        f"&redirect_uri={quote(DASHBOARD_REDIRECT_URI, safe='')}"
+        f"&response_type=code&scope=identify"
+    )
+    return RedirectResponse(auth_url)
+
+@app.get("/dashboard/logout")
+async def dashboard_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/dashboard/login")
+
+@app.get("/dashboard/callback", response_class=HTMLResponse)
+async def dashboard_callback(request: Request, code: str):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            token_resp = await client.post(
+                "https://discord.com/api/oauth2/token",
+                data={
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": DASHBOARD_REDIRECT_URI,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            token_data = token_resp.json()
+        except Exception as e:
+            logger.error(f"대시보드 OAuth 토큰 요청 실패: {e}")
+            return HTMLResponse("<h2>❌ 로그인 실패: 디스코드와 통신할 수 없습니다.</h2>", status_code=502)
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            return HTMLResponse("<h2>❌ 로그인 실패: 토큰을 발급받지 못했습니다.</h2>", status_code=400)
+
+        try:
+            user_resp = await client.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"})
+            user_data = user_resp.json()
+        except Exception as e:
+            logger.error(f"대시보드 유저 정보 조회 실패: {e}")
+            return HTMLResponse("<h2>❌ 로그인 실패: 사용자 정보를 가져오지 못했습니다.</h2>", status_code=502)
+
+    user_id = user_data.get("id")
+    username = user_data.get("username", "알 수 없음")
+    if not user_id:
+        return HTMLResponse("<h2>❌ 로그인 실패: 사용자 ID를 확인할 수 없습니다.</h2>", status_code=400)
+
+    if not await is_dashboard_admin(int(user_id)):
+        return HTMLResponse(f"""
+        <html><head><meta charset="UTF-8">{DASHBOARD_PAGE_STYLE}</head>
+        <body><div class="login-card">
+        <h2>🚫 접근 권한 없음</h2>
+        <p style="color:#94a3b8;">{username}님은 봇 관리자로 등록되어 있지 않습니다.</p>
+        <a class="login-btn" href="/dashboard/login">다시 로그인</a>
+        </div></body></html>
+        """, status_code=403)
+
+    request.session["user_id"] = int(user_id)
+    request.session["username"] = username
+    return RedirectResponse("/dashboard")
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_home(request: Request):
+    user_id = request.session.get("user_id")
+    username = request.session.get("username")
+
+    if not user_id:
+        return HTMLResponse(f"""
+        <html><head><meta charset="UTF-8"><title>DinoBot 대시보드 로그인</title>{DASHBOARD_PAGE_STYLE}</head>
+        <body><div class="login-card">
+        <h2>🦖 DinoBot 관리 대시보드</h2>
+        <p style="color:#94a3b8;">봇 관리자 계정으로 디스코드 로그인 후 이용할 수 있습니다.</p>
+        <a class="login-btn" href="/dashboard/login">디스코드로 로그인</a>
+        </div></body></html>
+        """)
+
+    # 세션은 있지만 관리자 자격을 재확인 (강등된 경우 즉시 차단)
+    if not await is_dashboard_admin(int(user_id)):
+        request.session.clear()
+        return RedirectResponse("/dashboard/login")
+
+    guilds = bot.guilds
+    db_ok = await DB.healthcheck()
+    discord_ok = _bot_ready_event.is_set() and not bot.is_closed()
+
+    licensed_count = 0
+    guild_cards_html = []
+
+    for g in guilds:
+        reg_info = await DB.fetchone("SELECT expires_at, tier FROM registered_guilds WHERE guild_id = %s", g.id)
+        is_reg = await is_guild_registered(g.id)
+        if is_reg:
+            licensed_count += 1
+        exp_text = reg_info.get("expires_at", "미등록") if reg_info else "미등록"
+        tier_text = TIER_LABEL.get((reg_info.get("tier") if reg_info else None) or "bronze", "🥉 브론즈")
+
+        item_count_row = await DB.fetchone("SELECT COUNT(*) AS c FROM prices WHERE guild_id = %s", g.id)
+        item_count = item_count_row.get("c", 0) if item_count_row else 0
+
+        keys = await DB.fetchall('SELECT "key", key_type, is_used, expires_at FROM recovery_keys WHERE guild_id = %s ORDER BY created_at DESC', g.id)
+        perm_keys = [k for k in keys if k.get("key_type") == "permanent"]
+        one_time_keys = [k for k in keys if k.get("key_type") == "one_time"][:5]
+
+        perm_html = "".join(_reveal_key_html(k["key"]) for k in perm_keys) if perm_keys else '<span class="empty">발급 내역 없음</span>'
+        onetime_html = "".join(
+            _reveal_key_html(k["key"]) + (' <span class="badge bad">사용됨</span>' if k.get("is_used") else ' <span class="badge ok">유효</span>')
+            for k in one_time_keys
+        ) if one_time_keys else '<span class="empty">발급 내역 없음</span>'
+
+        license_badge = '<span class="badge ok">승인됨</span>' if is_reg else '<span class="badge bad">미승인</span>'
+
+        guild_cards_html.append(f"""
+        <div class="guild-card">
+            <h3>🏰 {g.name} <span style="color:#64748b;font-weight:400;font-size:13px;">({g.id})</span></h3>
+            <div class="row">
+                <div>👥 인원: {g.member_count}명</div>
+                <div>🛍️ 등록 상품: {item_count}개</div>
+                <div>🔑 라이센스: {license_badge} <span style="color:#94a3b8;">({exp_text})</span></div>
+                <div>🏷️ 티어: {tier_text}</div>
+            </div>
+            <div class="key-block">
+                <div class="label">♾️ 영구 복구키</div>
+                {perm_html}
+            </div>
+            <div class="key-block">
+                <div class="label">⏱️ 최근 일회용 복구키 (최대 5개)</div>
+                {onetime_html}
+            </div>
+        </div>
+        """)
+
+    summary_html = f"""
+    <div class="summary">
+        <div class="stat-card"><div class="num">{len(guilds)}</div><div class="label">전체 서버 수</div></div>
+        <div class="stat-card"><div class="num">{licensed_count}</div><div class="label">라이센스 승인 서버</div></div>
+        <div class="stat-card"><div class="num">{'✅' if db_ok else '⚠️'}</div><div class="label">DB 상태</div></div>
+        <div class="stat-card"><div class="num">{'✅' if discord_ok else '⚠️'}</div><div class="label">디스코드 연결</div></div>
+    </div>
+    """
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <title>DinoBot 관리 대시보드</title>
+        {DASHBOARD_PAGE_STYLE}
+    </head>
+    <body>
+        <div class="topbar">
+            <h1>🦖 DinoBot 관리 대시보드</h1>
+            <div>
+                <span class="user-chip">👤 {username}</span>
+                <a href="/dashboard/logout" style="margin-left:12px;">로그아웃</a>
+            </div>
+        </div>
+        {summary_html}
+        {''.join(guild_cards_html) if guild_cards_html else '<p class="empty">봇이 참여 중인 서버가 없습니다.</p>'}
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
