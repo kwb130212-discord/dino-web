@@ -10,6 +10,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 BASE_URL = "https://dino-web-2trw.onrender.com"
 
 
+def _front(app, route):
+    try:
+        app.router.routes.remove(route)
+        app.router.routes.insert(0, route)
+    except ValueError:
+        pass
+
+
 def install(core) -> None:
     app = core.app
 
@@ -39,3 +47,9 @@ def install(core) -> None:
     @app.get("/oauth/login")
     async def oauth_login_alias(request: Request):
         return RedirectResponse("/dashboard/login")
+
+    # core.py registers its legacy GET / before this module is installed.
+    # FastAPI matches the first route, so promote the public aliases explicitly.
+    for route in list(app.router.routes):
+        if getattr(route, "path", None) in {"/", "/login", "/oauth/login"}:
+            _front(app, route)
