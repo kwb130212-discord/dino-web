@@ -23,9 +23,7 @@ class VerifyView(discord.ui.View):
     async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        row = await self.core.DB.fetchone(
-            "SELECT verification_role_id FROM guild_settings WHERE guild_id=%s", interaction.guild.id
-        ) or {}
+        row = await self.core.DB.fetchone("SELECT verification_role_id FROM guild_settings WHERE guild_id=%s", interaction.guild.id) or {}
         role = interaction.guild.get_role(int(row.get("verification_role_id") or 0))
         if role is None:
             return await interaction.response.send_message("인증 역할이 설정되지 않았습니다.", ephemeral=True)
@@ -54,6 +52,8 @@ def install(core) -> None:
             await DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verification_channel_id BIGINT")
             await DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verification_role_id BIGINT")
             await DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verification_message TEXT DEFAULT '아래 버튼을 눌러 서버 인증을 완료하세요.'")
+            await DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS ticket_question TEXT DEFAULT '무엇을 도와드릴까요?'")
+            await DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS ticket_questions_enabled INTEGER DEFAULT 0")
         except Exception:
             log.exception("webboard migration failed")
 
@@ -120,17 +120,15 @@ def install(core) -> None:
         tr = guild.get_role(int(s.get("ticket_role_id") or 0))
         enabled = bool(int(s.get("ticket_questions_enabled") or 0))
         question = s.get("ticket_question") or s.get("ticket_message") or "무엇을 도와드릴까요?"
-
         cards = f"""
 <section class='card'><h2>📥📤 입장 / 퇴장 로그</h2><p class='muted'>입퇴장 및 감사 로그 채널을 관리합니다.</p><form onsubmit='save(event)'><input type='hidden' name='section' value='logs'><div class='field'><label>감사 로그 채널 ID</label><input class='input' name='log_channel_id' value='{esc(s.get("log_channel_id") or "")}'></div><div class='status'>{'🟢 '+esc(lc.name) if lc else '🔴 로그 채널 미설정'}</div><button class='btn primary'>저장</button></form></section>
 <section class='card'><h2>🔐 서버 인증</h2><p class='muted'>인증 채널/역할과 안내문을 관리합니다.</p><form onsubmit='save(event)'><input type='hidden' name='section' value='verify'><div class='field'><label>인증 채널 ID</label><input class='input' name='verification_channel_id' value='{esc(s.get("verification_channel_id") or "")}'></div><div class='field'><label>인증 역할 ID</label><input class='input' name='verification_role_id' value='{esc(s.get("verification_role_id") or "")}'></div><div class='field'><label>안내문</label><textarea class='textarea' name='verification_message'>{esc(s.get("verification_message") or "아래 버튼을 눌러 서버 인증을 완료하세요.")}</textarea></div><div class='status'>{'🟢 '+esc(vr.name) if vr else '🔴 역할 미설정'} · {'🟢 채널 연결' if vc else '🔴 채널 미설정'}</div><div class='actions'><button class='btn primary'>저장</button><button type='button' class='btn success' onclick='sendVerify()'>인증 패널 보내기</button></div></form></section>
 <section class='card wide'><h2>🎫 티켓</h2><p class='muted'>티켓 카테고리, 담당 역할, 생성 질문을 관리합니다.</p><form onsubmit='save(event)'><input type='hidden' name='section' value='tickets'><div class='grid'><div class='field'><label>티켓 카테고리 ID</label><input class='input' name='ticket_category_id' value='{esc(s.get("ticket_category_id") or "")}'></div><div class='field'><label>티켓 담당 역할 ID</label><input class='input' name='ticket_role_id' value='{esc(s.get("ticket_role_id") or "")}'></div></div><div class='field'><label>문의 질문</label><textarea class='textarea' name='ticket_question'>{esc(question)}</textarea></div><label class='status'><input type='checkbox' name='ticket_questions_enabled' {'checked' if enabled else ''}> 티켓 생성 전에 질문 받기</label><button class='btn primary'>티켓 설정 저장</button></form><div class='status'>카테고리: {esc(getattr(tc,'name',None) or '미설정')} · 담당 역할: {esc(getattr(tr,'name',None) or '미설정')}</div></section>
 <section class='card wide'><h2>🧭 연결 상태</h2><div class='status'>📋 로그 {'🟢' if lc else '🔴'} · 🔐 인증 {'🟢' if vc and vr else '🔴'} · 🎫 티켓 {'🟢' if tc else '🔴'}</div></section>"""
-
         nav = f"<div class='brand'><span class='logo'>🦖</span>DinoBot</div><div class='nav-title'>웹보드</div><nav class='nav'><a class='active' href='/dashboard/server/{guild_id}/webboard'>⚙️ 서버 기능</a><a href='/dashboard/server/{guild_id}'>← 기존 관리</a><a href='/dashboard/logout'>↪ 로그아웃</a></nav>"
         js = f"""<script>const gid={guild_id},csrf={repr(token)};async function api(url,options={{}}){{options.headers={{...(options.headers||{{}}),'X-CSRF-Token':csrf}};const r=await fetch(url,options);const t=await r.text();let d={{}};try{{d=t?JSON.parse(t):{{}}}}catch{{d={{detail:t}}}}if(!r.ok)throw Error(d.detail||'요청 실패');return d}}async function save(e){{e.preventDefault();try{{const d=await api('/dashboard/api/server/'+gid+'/webboard/settings',{{method:'POST',body:new FormData(e.target)}});alert(d.message||'저장되었습니다.');location.reload()}}catch(x){{alert(x.message)}}}}async function sendVerify(){{try{{const d=await api('/dashboard/api/server/'+gid+'/webboard/verification-panel',{{method:'POST'}});alert(d.message)}}catch(x){{alert(x.message)}}}}</script>"""
         desktop = f"<div class='desktop-only desktop-shell'><aside class='sidebar'>{nav}</aside><main class='desktop-main'><div class='top'><div><h1>⚙️ 서버 기능 관리</h1><div class='muted'>{esc(guild.name)} · 관리자 {uid}</div></div></div><div class='grid'>{cards}</div></main></div>"
-        mobile = f"<div class='mobile-only mobile-shell'><header class='mobile-header'><span class='mobile-brand'>🦖 DinoBot</span><a class='nav a' href='/dashboard/logout'>로그아웃</a></header><nav class='mobile-nav'><a href='/dashboard/server/{guild_id}'>← 관리</a><a href='/dashboard/server/{guild_id}/webboard'>⚙️ 기능</a></nav><main class='mobile-main'><div class='top'><h1>⚙️ 서버 기능</h1><div class='muted'>{esc(guild.name)}</div></div><div class='grid'>{cards}</div></main></div>"
+        mobile = f"<div class='mobile-only mobile-shell'><header class='mobile-header'><span class='mobile-brand'>🦖 DinoBot</span><a class='mobile-nav' href='/dashboard/logout'>로그아웃</a></header><nav class='mobile-nav'><a href='/dashboard/server/{guild_id}'>← 관리</a><a href='/dashboard/server/{guild_id}/webboard'>⚙️ 기능</a></nav><main class='mobile-main'><div class='top'><h1>⚙️ 서버 기능</h1><div class='muted'>{esc(guild.name)}</div></div><div class='grid'>{cards}</div></main></div>"
         return page(f"DinoBot · {guild.name} 웹보드", desktop + mobile + js)
 
     async def save_settings(request: Request, guild_id: int, section: str = Form(""), log_channel_id: str = Form(""), verification_channel_id: str = Form(""), verification_role_id: str = Form(""), verification_message: str = Form(""), ticket_category_id: str = Form(""), ticket_role_id: str = Form(""), ticket_question: str = Form(""), ticket_questions_enabled: str = Form("")):
@@ -140,19 +138,15 @@ def install(core) -> None:
         if not csrf_ok(request):
             return JSONResponse({"detail":"CSRF 검증에 실패했습니다."}, status_code=403)
         await migrate()
-
         def ident(value):
             value = (value or "").strip()
             return int(value) if value.isdigit() and int(value) > 0 else None
-
-        current = await DB.fetchone("SELECT * FROM guild_settings WHERE guild_id=%s", guild_id) or {}
         if section == "logs":
             await DB.execute("UPDATE guild_settings SET log_channel_id=%s WHERE guild_id=%s", ident(log_channel_id), guild_id)
         elif section == "verify":
             await DB.execute("UPDATE guild_settings SET verification_channel_id=%s, verification_role_id=%s, verification_message=%s WHERE guild_id=%s", ident(verification_channel_id), ident(verification_role_id), verification_message.strip() or "아래 버튼을 눌러 서버 인증을 완료하세요.", guild_id)
         elif section == "tickets":
-            enabled = 1 if ticket_questions_enabled else 0
-            await DB.execute("UPDATE guild_settings SET ticket_category_id=%s, ticket_role_id=%s, ticket_question=%s, ticket_questions_enabled=%s WHERE guild_id=%s", ident(ticket_category_id), ident(ticket_role_id), ticket_question.strip() or "무엇을 도와드릴까요?", enabled, guild_id)
+            await DB.execute("UPDATE guild_settings SET ticket_category_id=%s, ticket_role_id=%s, ticket_question=%s, ticket_questions_enabled=%s WHERE guild_id=%s", ident(ticket_category_id), ident(ticket_role_id), ticket_question.strip() or "무엇을 도와드릴까요?", 1 if ticket_questions_enabled else 0, guild_id)
         else:
             return JSONResponse({"detail":"알 수 없는 설정입니다."}, status_code=400)
         return JSONResponse({"ok": True, "message": "설정이 저장되었습니다."})
