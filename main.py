@@ -20,6 +20,7 @@ from webboard_features_v3 import install as install_webboard_features
 from dashboard_servers_v2 import install as install_dashboard_servers
 from dashboard_device_v3 import install as install_dashboard_device
 from auth_settings import install as install_auth_settings
+from dashboard_v4 import install as install_dashboard_v4
 
 install_startup_fixes(core)
 install_web_entry(core)
@@ -33,6 +34,8 @@ install_webboard_features(core)
 install_dashboard_servers(core)
 install_dashboard_device(core)
 install_auth_settings(core)
+# v4 is loaded last so the server-first UI owns the exact dashboard routes.
+install_dashboard_v4(core)
 
 app = core.app
 bot = core.bot
