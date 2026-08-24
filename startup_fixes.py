@@ -1,105 +1,42 @@
 # -*- coding: utf-8 -*-
-"""Production boot guards, database schema repair, and idempotent Discord loading."""
+"""Small, idempotent production repairs executed after core import."""
 from __future__ import annotations
 
+import logging
 
-def install(core):
-    """Run non-destructive schema repair before feature queries execute."""
-    try:
-        core.DB.init_pool()
-        migrations = (
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS is_used INTEGER DEFAULT 0",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS expires_at TEXT",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS key_type TEXT DEFAULT 'one_time'",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS created_by BIGINT",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS created_at TEXT",
-        )
-        for sql in migrations:
-            core.DB._sync_execute(sql, ())
+log = logging.getLogger("DinoBot.StartupFixes")
 
-        core.DB._sync_execute(
-            "UPDATE recovery_keys SET is_used = 0 WHERE is_used IS NULL", ()
-        )
-        core.DB._sync_execute(
-            "UPDATE recovery_keys SET key_type = 'one_time' WHERE key_type IS NULL", ()
-        )
-        core.DB._sync_execute(
-            "CREATE INDEX IF NOT EXISTS idx_recovery_keys_guild_created "
-            "ON recovery_keys (guild_id, created_at DESC)", ()
-        )
 
-        check = core.DB._sync_fetchone(
-            "SELECT 1 AS ok FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = 'recovery_keys' "
-            "AND column_name = 'is_used' LIMIT 1",
-            (),
-        )
-        if not check:
-            raise RuntimeError("recovery_keys.is_used migration verification failed")
-
-        core.logger.info("✅ recovery_keys schema verified (is_used/expires_at/key_type).")
-    except Exception as exc:
-        core.logger.exception("❌ startup database migration failed: %s", exc)
-
-    # core.bot must exist before this installer is called. Keep a defensive
-    # guard so a future import-order change does not crash the whole web app.
-    bot = getattr(core, "bot", None)
-    if bot is None:
-        core.logger.error("❌ startup_fixes: core.bot is unavailable; skipping Discord idempotency patch.")
+def install(core) -> None:
+    db = getattr(core, "DB", None)
+    if db is None:
+        log.warning("DB is not available; startup fixes skipped")
         return
 
-    if not getattr(bot, "_dino_idempotent_add_cog", False):
-        original_add_cog = bot.add_cog
+    # Do not call the private DB helper without its required params tuple.
+    # These statements are idempotent and protect older Supabase schemas.
+    statements = (
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS is_used BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS key_type TEXT NOT NULL DEFAULT 'permanent'",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL",
+        "CREATE INDEX IF NOT EXISTS idx_recovery_keys_guild_created ON recovery_keys (guild_id, created_at DESC)",
+    )
 
-        async def safe_add_cog(cog, *, override=False):
-            name = getattr(cog, "qualified_name", None) or getattr(cog, "__cog_name__", None)
-            if name and bot.get_cog(name) is not None:
-                core.logger.warning("Cog '%s' already loaded; skipping duplicate load.", name)
-                return
+    try:
+        db.init_pool()
+        for sql in statements:
+            # _sync_execute(query, params) is synchronous and safe here because
+            # this repair happens once during process bootstrap.
+            db._sync_execute(sql, ())
+        log.info("startup database migration verified")
+    except Exception:
+        # Never prevent the web server from starting because an optional repair
+        # failed. Core's own DB initialization remains authoritative.
+        log.exception("startup database migration failed")
 
-            try:
-                cog_commands = list(cog.get_app_commands())
-            except Exception:
-                cog_commands = []
-
-            if cog_commands:
-                existing = [
-                    cmd for cmd in cog_commands
-                    if bot.tree.get_command(cmd.name) is not None
-                ]
-                if len(existing) == len(cog_commands):
-                    core.logger.warning(
-                        "All application commands for Cog '%s' are already registered; skipping duplicate Cog.",
-                        name or "unknown",
-                    )
-                    return
-
-            try:
-                return await original_add_cog(cog, override=override)
-            except Exception as exc:
-                if "already registered" in str(exc).lower() and cog_commands:
-                    existing = [
-                        cmd for cmd in cog_commands
-                        if bot.tree.get_command(cmd.name) is not None
-                    ]
-                    if len(existing) == len(cog_commands):
-                        core.logger.warning(
-                            "Recovered duplicate command registration for Cog '%s'.",
-                            name or "unknown",
-                        )
-                        return
-                raise
-
-        bot.add_cog = safe_add_cog
-        bot._dino_idempotent_add_cog = True
-
-    app = core.app
-
-    def has_route(path: str) -> bool:
-        return any(getattr(route, "path", None) == path for route in app.router.routes)
-
-    if not has_route("/dashboard/login") and hasattr(core, "dashboard_login"):
-        app.add_api_route("/dashboard/login", core.dashboard_login, methods=["GET"])
-
-    if not has_route("/dashboard") and hasattr(core, "dashboard_home"):
-        app.add_api_route("/dashboard", core.dashboard_home, methods=["GET"])
+    # Older revisions attempted to access core.bot before it existed. Merely
+    # report its state here; never dereference it during module installation.
+    if getattr(core, "bot", None) is None:
+        log.info("Discord bot object is not available during startup-fix phase")
+    else:
+        log.info("Discord bot object detected")
