@@ -9,7 +9,7 @@ def install(core) -> None:
     app, bot = core.app, core.bot
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     def esc(v): return html.escape("" if v is None else str(v), quote=True)
-    async def auth(request):
+    async def auth(request: Request):
         raw=request.session.get("user_id")
         if raw is None: return RedirectResponse("/dashboard/login")
         try: uid=int(raw)
@@ -37,19 +37,19 @@ def install(core) -> None:
     MOBILE="""
     :root{color-scheme:dark;--bg:#070b14;--panel:#101827;--line:#22304a;--text:#f7f9fc;--muted:#91a0b7;--blue:#5865f2}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,Pretendard,system-ui}.bar{height:60px;padding:0 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;background:#080e19}.brand{font-weight:900;font-size:18px}.wrap{padding:22px 14px 45px}.heading h1{font-size:27px;margin:0}.heading p{color:var(--muted);line-height:1.6;margin:7px 0 17px}.search{width:100%;padding:13px;border:1px solid var(--line);background:#0b1321;color:#fff;border-radius:11px;margin-bottom:18px}.grid{display:grid;gap:12px}.server{padding:15px;border:1px solid var(--line);border-radius:15px;background:var(--panel);display:grid;grid-template-columns:52px 1fr;gap:12px;align-items:center}.ico{width:52px;height:52px;border-radius:14px;object-fit:cover}.fallback{display:grid;place-items:center;background:#1c2940;font-size:22px}.info b{display:block;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.info small{display:block;color:#687992;font-size:9px;margin-top:3px}.ok,.wait{font-size:10px;display:block;margin-top:6px}.ok{color:#5fe59b}.wait{color:#ffc55c}.btn{grid-column:1/-1;height:43px;display:flex;justify-content:center;align-items:center;border-radius:10px;border:1px solid var(--line);background:#151f32;color:#fff;text-decoration:none;font-weight:800}.primary{background:var(--blue);border-color:var(--blue)}.empty{padding:35px 15px;text-align:center;border:1px dashed var(--line);border-radius:15px;color:var(--muted)}
     """
-    async def desktop(request):
+    async def desktop(request: Request):
         r=await auth(request)
         if r:return r
         owned=request.session.get("owned_guilds") or []
         body=f"<header class='top'><div class='brand'>🦖 DinoBot</div><nav class='nav'><a class='active' href='/dashboard/desktop'>내 서버</a></nav><div class='account'>{esc(request.session.get('user_name') or 'Discord 사용자')} · <a href='/dashboard/logout' style='color:#9ba9bf'>로그아웃</a></div></header><main class='wrap'><section class='heading'><div><h1>내 서버</h1><p>PC 전용 관리 콘솔입니다. 서버를 선택해 자판기·티켓·인증·로그를 설정하세요.</p></div><input class='search' id='search' placeholder='서버 검색'></section><section class='grid'>{cards(owned)}</section></main><script>document.getElementById('search').oninput=e=>document.querySelectorAll('.server').forEach(x=>x.style.display=x.innerText.toLowerCase().includes(e.target.value.toLowerCase())?'grid':'none')</script>"
         return page(body,DESKTOP,"DinoBot · PC")
-    async def mobile(request):
+    async def mobile(request: Request):
         r=await auth(request)
         if r:return r
         owned=request.session.get("owned_guilds") or []
         body=f"<header class='bar'><div class='brand'>🦖 DinoBot</div><a href='/dashboard/logout' style='color:#9ba9bf;text-decoration:none'>로그아웃</a></header><main class='wrap'><section class='heading'><h1>내 서버</h1><p>모바일 전용 관리 화면입니다.</p></section><input class='search' id='search' placeholder='🔎 서버 검색'><section class='grid'>{cards(owned)}</section></main><script>document.getElementById('search').oninput=e=>document.querySelectorAll('.server').forEach(x=>x.style.display=x.innerText.toLowerCase().includes(e.target.value.toLowerCase())?'grid':'none')</script>"
         return page(body,MOBILE,"DinoBot · 모바일")
-    async def dashboard(request):
+    async def dashboard(request: Request):
         ua=request.headers.get("user-agent","").lower()
         mobile=any(x in ua for x in ("android","iphone","ipad","ipod","mobile"))
         return RedirectResponse("/dashboard/mobile" if mobile else "/dashboard/desktop")
