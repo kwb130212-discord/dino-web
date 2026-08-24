@@ -10,9 +10,12 @@ import logging
 import os
 
 PRODUCTION_BASE_URL = "https://dino-web-2trw.onrender.com"
-os.environ.setdefault("REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback")
-os.environ.setdefault("DASHBOARD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback")
-os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
+CANONICAL_REDIRECT_URI = f"{PRODUCTION_BASE_URL}/dashboard/callback"
+# Deliberately canonical in production. This prevents a stale Render env value
+# from silently reintroducing /auth/callback or another host.
+os.environ["REDIRECT_URI"] = CANONICAL_REDIRECT_URI
+os.environ["DASHBOARD_REDIRECT_URI"] = CANONICAL_REDIRECT_URI
+os.environ["TRIAL_REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/trial/callback"
 
 import uvicorn
 import core
@@ -36,7 +39,6 @@ def _install_once(name: str, installer, *, required: bool = False) -> None:
             raise
 
 
-# Import installers only after core has fully initialized app/bot/DB objects.
 from startup_fixes import install as install_startup_fixes
 from web_entry import install as install_web_entry
 from dashboard_auth import install as install_dashboard_auth
@@ -46,8 +48,6 @@ from persistent_settings import install as install_persistent_settings
 from dashboard_shortcuts import install as install_dashboard_shortcuts
 from webboard_features import install as install_webboard_features
 
-# Startup schema repair must run first. It is intentionally non-fatal: core's
-# normal DB initialization remains the source of truth for the application.
 _install_once("startup_fixes", install_startup_fixes)
 _install_once("web_entry", install_web_entry, required=True)
 _install_once("dashboard_auth", install_dashboard_auth, required=True)
