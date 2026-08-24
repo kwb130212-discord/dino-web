@@ -19,6 +19,7 @@ from dashboard_shortcuts import install as install_dashboard_shortcuts
 from webboard_features_v3 import install as install_webboard_features
 from dashboard_servers_v2 import install as install_dashboard_servers
 from dashboard_device_v3 import install as install_dashboard_device
+from auth_settings import install as install_auth_settings
 
 install_startup_fixes(core)
 install_web_entry(core)
@@ -31,6 +32,7 @@ install_dashboard_shortcuts(core)
 install_webboard_features(core)
 install_dashboard_servers(core)
 install_dashboard_device(core)
+install_auth_settings(core)
 
 app = core.app
 bot = core.bot
