@@ -4,10 +4,7 @@ from __future__ import annotations
 
 
 def install(core):
-    """Run non-destructive schema repair before any feature queries are executed."""
-
-    # IMPORTANT: this runs during main.py import, before the bot/web feature
-    # modules start handling requests.  Every migration is idempotent.
+    """Run non-destructive schema repair before feature queries execute."""
     try:
         core.DB.init_pool()
         migrations = (
@@ -18,21 +15,19 @@ def install(core):
             "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS created_at TEXT",
         )
         for sql in migrations:
-            core.DB._sync_execute(sql)
+            core.DB._sync_execute(sql, ())
 
-        # Repair NULLs left by older installations and make the hot lookup cheap.
         core.DB._sync_execute(
-            "UPDATE recovery_keys SET is_used = 0 WHERE is_used IS NULL"
+            "UPDATE recovery_keys SET is_used = 0 WHERE is_used IS NULL", ()
         )
         core.DB._sync_execute(
-            "UPDATE recovery_keys SET key_type = 'one_time' WHERE key_type IS NULL"
+            "UPDATE recovery_keys SET key_type = 'one_time' WHERE key_type IS NULL", ()
         )
         core.DB._sync_execute(
             "CREATE INDEX IF NOT EXISTS idx_recovery_keys_guild_created "
-            "ON recovery_keys (guild_id, created_at DESC)"
+            "ON recovery_keys (guild_id, created_at DESC)", ()
         )
 
-        # Verify the actual PostgreSQL schema instead of assuming ALTER succeeded.
         check = core.DB._sync_fetchone(
             "SELECT 1 AS ok FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'recovery_keys' "
@@ -46,7 +41,13 @@ def install(core):
     except Exception as exc:
         core.logger.exception("❌ startup database migration failed: %s", exc)
 
-    bot = core.bot
+    # core.bot must exist before this installer is called. Keep a defensive
+    # guard so a future import-order change does not crash the whole web app.
+    bot = getattr(core, "bot", None)
+    if bot is None:
+        core.logger.error("❌ startup_fixes: core.bot is unavailable; skipping Discord idempotency patch.")
+        return
+
     if not getattr(bot, "_dino_idempotent_add_cog", False):
         original_add_cog = bot.add_cog
 
@@ -97,8 +98,8 @@ def install(core):
     def has_route(path: str) -> bool:
         return any(getattr(route, "path", None) == path for route in app.router.routes)
 
-    if not has_route("/dashboard/login"):
+    if not has_route("/dashboard/login") and hasattr(core, "dashboard_login"):
         app.add_api_route("/dashboard/login", core.dashboard_login, methods=["GET"])
 
-    if not has_route("/dashboard"):
+    if not has_route("/dashboard") and hasattr(core, "dashboard_home"):
         app.add_api_route("/dashboard", core.dashboard_home, methods=["GET"])
