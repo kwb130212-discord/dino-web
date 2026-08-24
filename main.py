@@ -3,8 +3,6 @@
 import os
 
 # Production OAuth callback is intentionally fixed to the deployed Render URL.
-# This prevents an incorrect REDIRECT_URI environment variable from breaking
-# Discord OAuth with an "Invalid OAuth2 redirect_uri" error.
 PRODUCTION_BASE_URL = "https://dino-web-2trw.onrender.com"
 os.environ["REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
 os.environ["DASHBOARD_REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
@@ -19,6 +17,7 @@ from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
 from persistent_settings import install as install_persistent_settings
 from dashboard_shortcuts import install as install_dashboard_shortcuts
+from webboard_features import install as install_webboard_features
 
 # DB compatibility/migrations first.
 install_startup_fixes(core)
@@ -31,6 +30,8 @@ install_tutorial_logs(core)
 install_ticket_control(core)
 install_persistent_settings(core)
 install_dashboard_shortcuts(core)
+# Web Control Center: logs, server verification and ticket settings.
+install_webboard_features(core)
 
 app = core.app
 bot = core.bot
