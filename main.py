@@ -17,6 +17,7 @@ from ticket_control import install as install_ticket_control
 from persistent_settings import install as install_persistent_settings
 from dashboard_shortcuts import install as install_dashboard_shortcuts
 from webboard_features_v3 import install as install_webboard_features
+from dashboard_roles import install as install_dashboard_roles
 
 install_startup_fixes(core)
 install_web_entry(core)
@@ -27,6 +28,7 @@ install_ticket_control(core)
 install_persistent_settings(core)
 install_dashboard_shortcuts(core)
 install_webboard_features(core)
+install_dashboard_roles(core)
 
 app = core.app
 bot = core.bot
