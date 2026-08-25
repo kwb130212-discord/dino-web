@@ -2,7 +2,9 @@
 """DinoBot production entrypoint."""
 import os
 
-PRODUCTION_BASE_URL = "https://dino-web-2trw.onrender.com"
+# Single canonical public origin. Keep OAuth redirect construction centralized.
+PRODUCTION_BASE_URL = "https://dinobotservice.64bit.kr"
+os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 os.environ["REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
 os.environ["DASHBOARD_REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
 
@@ -35,7 +37,6 @@ install_webboard_features(core)
 install_dashboard_servers(core)
 install_dashboard_device(core)
 install_auth_settings(core)
-# v4 is loaded last so the server-first UI owns the exact dashboard routes.
 install_dashboard_v4(core)
 install_keepalive(core)
 
