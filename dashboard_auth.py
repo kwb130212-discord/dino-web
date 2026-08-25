@@ -92,11 +92,14 @@ def install(core) -> None:
                 owned.append({"id": str(guild.get("id")), "name": str(guild.get("name") or "이름 없는 서버"), "icon": guild.get("icon")})
         admin = await core.is_dashboard_admin(uid)
         oauth_diag(request, "discord_identity_verified", user_id=uid, owner_guild_count=len(owned), admin=admin)
-        if not admin:
-            return page('<div class="wrap"><main class="card"><h1 class="title">접근 권한이 없습니다.</h1><p class="desc">관리자로 등록된 Discord 계정만 접근할 수 있습니다.</p></main></div>')
+
+        # Every authenticated Discord user may use the normal dashboard.
+        # Administrator status is stored separately and consumed by privileged
+        # dashboard controls; it must not block ordinary users from signing in.
         request.session.clear()
         request.session["user_id"] = uid
         request.session["user_name"] = name
+        request.session["is_admin"] = bool(admin)
         avatar = me.get("avatar")
         request.session["avatar_url"] = f"https://cdn.discordapp.com/avatars/{uid}/{avatar}.png?size=128" if avatar else "https://cdn.discordapp.com/embed/avatars/0.png"
         request.session["owned_guilds"] = owned
