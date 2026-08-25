@@ -2,10 +2,14 @@
 """Stable Discord OAuth UI for DinoBot Control Center."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
+import hmac
+import json
 import logging
 import os
-import secrets
+import time
 from urllib.parse import urlencode
 
 import httpx
@@ -13,20 +17,50 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 log = logging.getLogger("DinoBot.Auth")
+PUBLIC_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
+CANONICAL_REDIRECT_URI = f"{PUBLIC_BASE_URL}/dashboard/callback"
+
+
+def _state_secret() -> bytes:
+    # Prefer the stable production SESSION_SECRET. A stable secret is required
+    # across Render restarts; without it, login state is intentionally invalidated.
+    return (os.getenv("SESSION_SECRET") or os.getenv("DISCORD_CLIENT_SECRET") or "").encode("utf-8")
+
+
+def _make_state() -> str:
+    payload = {"v": 1, "iat": int(time.time()), "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")}
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    secret = _state_secret()
+    if not secret:
+        raise RuntimeError("SESSION_SECRET or DISCORD_CLIENT_SECRET must be configured")
+    sig = hmac.new(secret, raw, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(raw + b"." + sig).decode().rstrip("=")
+
+
+def _verify_state(state: str, max_age: int = 600) -> bool:
+    try:
+        rawsig = base64.urlsafe_b64decode(state + "=" * (-len(state) % 4))
+        raw, sig = rawsig.rsplit(b".", 1)
+        secret = _state_secret()
+        if not secret or not hmac.compare_digest(hmac.new(secret, raw, hashlib.sha256).digest(), sig):
+            return False
+        payload = json.loads(raw.decode())
+        return payload.get("v") == 1 and 0 <= int(time.time()) - int(payload["iat"]) <= max_age
+    except Exception:
+        return False
 
 
 def install(core) -> None:
     app = core.app
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
-    redirect_uri = os.getenv("REDIRECT_URI", "https://dino-web-2trw.onrender.com/dashboard/callback").strip()
+    redirect_uri = CANONICAL_REDIRECT_URI
 
     def oauth_diag(request: Request, stage: str, **extra):
         try:
             host = request.headers.get("host", "")
             proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-            env_uri = os.getenv("REDIRECT_URI", "")
-            checks = {"stage": stage, "configured_redirect_uri": redirect_uri, "env_redirect_uri_present": bool(env_uri), "env_redirect_uri_matches": env_uri.strip() == redirect_uri, "request_host": host, "request_scheme": request.url.scheme, "forwarded_proto": proto, "callback_path": str(request.url.path), "client_id_present": bool(client_id), "client_secret_present": bool(client_secret)}
+            checks = {"stage": stage, "configured_redirect_uri": redirect_uri, "request_host": host, "request_scheme": request.url.scheme, "forwarded_proto": proto, "callback_path": str(request.url.path), "client_id_present": bool(client_id), "client_secret_present": bool(client_secret)}
             checks.update(extra)
             log.warning("[OAUTH-DIAG] %s", " ".join(f"{k}={v!r}" for k, v in checks.items()))
         except Exception:
@@ -43,7 +77,13 @@ def install(core) -> None:
             return RedirectResponse("/dashboard")
         if not client_id:
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">OAuth 설정 오류</h1><p class="desc">DISCORD_CLIENT_ID가 없습니다.</p></main></div>')
-        state = secrets.token_urlsafe(32)
+        try:
+            state = _make_state()
+        except RuntimeError as exc:
+            log.error("OAuth state secret unavailable: %s", exc)
+            return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 환경변수를 설정해 주세요.</p></main></div>')
+        # Keep a copy for diagnostics/backward compatibility, but callback
+        # validation does not depend on the browser carrying the old session cookie.
         request.session["oauth_state"] = state
         params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": "identify guilds", "state": state, "prompt": "consent"}
         auth_url = "https://discord.com/oauth2/authorize?" + urlencode(params)
@@ -53,13 +93,13 @@ def install(core) -> None:
 
     @app.get("/dashboard/callback", response_class=HTMLResponse)
     async def dashboard_callback(request: Request):
-        oauth_diag(request, "callback_received", code_present=bool(request.query_params.get("code")), state_present=bool(request.query_params.get("state")), discord_error=request.query_params.get("error", ""))
+        state = request.query_params.get("state", "")
+        oauth_diag(request, "callback_received", code_present=bool(request.query_params.get("code")), state_present=bool(state), discord_error=request.query_params.get("error", ""))
         if request.query_params.get("error"):
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">Discord 인증 거부</h1><p class="desc">Discord가 OAuth 요청을 거부했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
-        state = request.query_params.get("state", "")
-        expected_state = request.session.pop("oauth_state", None)
-        if not state or state != expected_state:
-            return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">OAuth State 오류</h1><p class="desc">인증 세션이 일치하지 않습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
+        if not state or not _verify_state(state):
+            log.warning("[OAUTH-DIAG] stage='state_verification_failed' state_present=%s", bool(state))
+            return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">OAuth State 오류</h1><p class="desc">인증 세션이 일치하지 않습니다. 다시 로그인해 주세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
         code = request.query_params.get("code")
         if not code or not client_id or not client_secret:
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">필수 인증 설정이 없습니다.</p></main></div>')
@@ -82,7 +122,7 @@ def install(core) -> None:
         except Exception as exc:
             oauth_diag(request, "token_exchange_failed", exception_type=type(exc).__name__, exception=str(exc)[:300])
             log.exception("Discord OAuth API 오류")
-            return page('<div class="wrap"><main class="card"><h1 class="title">인증 실패</h1><p class="desc">Render 로그의 [OAUTH-DIAG]에서 실패 단계를 확인하세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
+            return page('<div class="wrap"><main class="card"><h1 class="title">인증 실패</h1><p class="desc">Discord 인증 처리 중 오류가 발생했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
 
         uid = int(me["id"])
         name = me.get("global_name") or me.get("username") or "Discord 사용자"
@@ -93,9 +133,6 @@ def install(core) -> None:
         admin = await core.is_dashboard_admin(uid)
         oauth_diag(request, "discord_identity_verified", user_id=uid, owner_guild_count=len(owned), admin=admin)
 
-        # Every authenticated Discord user may use the normal dashboard.
-        # Administrator status is stored separately and consumed by privileged
-        # dashboard controls; it must not block ordinary users from signing in.
         request.session.clear()
         request.session["user_id"] = uid
         request.session["user_name"] = name
