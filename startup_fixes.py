@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 
+async def _db_init_already_done():
+    """DB schema is initialized synchronously by install(); avoid a second startup pass."""
+    return None
+
+
 def install(core):
     """Create/repair the schema before feature modules are installed.
 
@@ -10,6 +15,9 @@ def install(core):
     schema is worse than failing because it can silently corrupt licenses,
     purchases or authentication state.
     """
+    # Perform the only schema initialization for this process here. DinoBot's
+    # setup_hook used to run the same migration a second time, which caused
+    # needless DB work and duplicate initialization logs on every deploy.
     core.DB._sync_init_db()
 
     migrations = (
@@ -45,6 +53,11 @@ def install(core):
         core.logger.exception("❌ required database migration failed: %s", exc)
         raise RuntimeError("DinoBot database migration failed; refusing partial startup") from exc
 
+    # setup_hook still calls DB.init_db() for backwards compatibility with the
+    # original core.py. Replace it with a no-op after the verified migration so
+    # the schema is not initialized twice.
+    core.DB.init_db = staticmethod(_db_init_already_done)
+
     bot = getattr(core, "bot", None)
     if bot is None:
         core.logger.error("❌ startup_fixes: core.bot is unavailable; skipping Discord idempotency patch.")
@@ -56,7 +69,7 @@ def install(core):
         async def safe_add_cog(cog, *, override=False):
             name = getattr(cog, "qualified_name", None) or getattr(cog, "__cog_name__", None)
             if name and bot.get_cog(name) is not None:
-                core.logger.warning("Cog '%s' already loaded; skipping duplicate load.", name)
+                core.logger.debug("Cog '%s' already loaded; skipping duplicate load.", name)
                 return
             try:
                 cog_commands = list(cog.get_app_commands())
@@ -65,7 +78,13 @@ def install(core):
             if cog_commands:
                 existing = [cmd for cmd in cog_commands if bot.tree.get_command(cmd.name) is not None]
                 if len(existing) == len(cog_commands):
-                    core.logger.warning("All application commands for Cog '%s' are already registered; skipping duplicate Cog.", name or "unknown")
+                    # ticket_control.py intentionally owns the newer ticket UI;
+                    # the legacy TicketCog is kept for compatibility but should
+                    # not produce a scary warning during normal startup.
+                    core.logger.debug(
+                        "Application commands for Cog '%s' already registered; skipping duplicate Cog.",
+                        name or "unknown",
+                    )
                     return
             try:
                 return await original_add_cog(cog, override=override)
@@ -73,7 +92,7 @@ def install(core):
                 if "already registered" in str(exc).lower() and cog_commands:
                     existing = [cmd for cmd in cog_commands if bot.tree.get_command(cmd.name) is not None]
                     if len(existing) == len(cog_commands):
-                        core.logger.warning("Recovered duplicate command registration for Cog '%s'.", name or "unknown")
+                        core.logger.debug("Recovered duplicate command registration for Cog '%s'.", name or "unknown")
                         return
                 raise
 
