@@ -3,15 +3,20 @@
 import os
 
 # Single canonical public origin for OAuth, dashboard links and callbacks.
-# Keep the Render deployment as the safe default; a custom domain can still be
-# supplied through DINO_PUBLIC_BASE_URL in Render Environment Variables.
+# A custom domain can still be supplied through DINO_PUBLIC_BASE_URL.
 PRODUCTION_BASE_URL = os.getenv(
     "DINO_PUBLIC_BASE_URL",
     "https://dino-web-2trw.onrender.com",
 ).rstrip("/")
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-os.environ["REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
-os.environ["DASHBOARD_REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
+
+# Keep each Discord OAuth flow on its own callback path.
+# Do NOT point REDIRECT_URI at /dashboard/callback: the bot's verification
+# buttons use /auth/callback, while the dashboard and trial flows have their
+# own callback endpoints.
+os.environ.setdefault("REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback")
+os.environ.setdefault("DASHBOARD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback")
+os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
 
 import uvicorn
 import core
