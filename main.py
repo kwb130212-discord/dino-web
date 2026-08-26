@@ -2,8 +2,7 @@
 """DinoBot production entrypoint."""
 import os
 
-# Canonical public origin used by OAuth, dashboard links and external callbacks.
-# Keep this identical to the Discord Developer Portal redirect configuration.
+# Single canonical public origin for OAuth, dashboard links and callbacks.
 PRODUCTION_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 os.environ["REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
@@ -12,6 +11,7 @@ os.environ["DASHBOARD_REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callbac
 import uvicorn
 import core
 from startup_fixes import install as install_startup_fixes
+from security_hardening import install as install_security_hardening
 from web_entry import install as install_web_entry
 from dashboard_auth import install as install_dashboard_auth
 from control_center import install as install_control_center
@@ -27,7 +27,9 @@ from dashboard_v4 import install as install_dashboard_v4
 from keepalive import install as install_keepalive
 from ip_analyzer import install as install_ip_analyzer
 
+# Boot order matters: schema first, security second, then routes/features.
 install_startup_fixes(core)
+install_security_hardening(core)
 install_web_entry(core)
 install_dashboard_auth(core)
 install_control_center(core)
