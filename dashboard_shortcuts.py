@@ -6,7 +6,8 @@ import os
 import discord
 from discord import app_commands
 
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://dino-web-2trw.onrender.com/dashboard")
+PUBLIC_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
+DASHBOARD_URL = f"{PUBLIC_BASE_URL}/dashboard"
 
 
 def install(core) -> None:
