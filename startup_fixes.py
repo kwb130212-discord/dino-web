@@ -4,45 +4,47 @@ from __future__ import annotations
 
 
 def install(core):
-    """Run non-destructive schema repair before feature queries execute."""
+    """Create/repair the schema before feature modules are installed.
+
+    A required migration failure must stop startup. Running with a partial
+    schema is worse than failing because it can silently corrupt licenses,
+    purchases or authentication state.
+    """
+    core.DB._sync_init_db()
+
+    migrations = (
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS is_used INTEGER DEFAULT 0",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS expires_at TEXT",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS key_type TEXT DEFAULT 'one_time'",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS created_by BIGINT",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS created_at TEXT",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS is_revoked INTEGER DEFAULT 0",
+        "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS used_at TEXT",
+        "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS processed_at TEXT",
+        "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS processed_by BIGINT",
+        "ALTER TABLE registered_guilds ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'bronze'",
+        "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'bronze'",
+        "CREATE INDEX IF NOT EXISTS idx_recovery_keys_guild_created ON recovery_keys (guild_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_recovery_keys_status ON recovery_keys (guild_id, is_revoked, is_used)",
+    )
+
     try:
-        core.DB.init_pool()
-        migrations = (
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS is_used INTEGER DEFAULT 0",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS expires_at TEXT",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS key_type TEXT DEFAULT 'one_time'",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS created_by BIGINT",
-            "ALTER TABLE recovery_keys ADD COLUMN IF NOT EXISTS created_at TEXT",
-        )
         for sql in migrations:
             core.DB._sync_execute(sql, ())
-
-        core.DB._sync_execute(
-            "UPDATE recovery_keys SET is_used = 0 WHERE is_used IS NULL", ()
-        )
-        core.DB._sync_execute(
-            "UPDATE recovery_keys SET key_type = 'one_time' WHERE key_type IS NULL", ()
-        )
-        core.DB._sync_execute(
-            "CREATE INDEX IF NOT EXISTS idx_recovery_keys_guild_created "
-            "ON recovery_keys (guild_id, created_at DESC)", ()
-        )
 
         check = core.DB._sync_fetchone(
             "SELECT 1 AS ok FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'recovery_keys' "
-            "AND column_name = 'is_used' LIMIT 1",
+            "AND column_name = 'is_revoked' LIMIT 1",
             (),
         )
         if not check:
-            raise RuntimeError("recovery_keys.is_used migration verification failed")
-
-        core.logger.info("✅ recovery_keys schema verified (is_used/expires_at/key_type).")
+            raise RuntimeError("recovery_keys.is_revoked migration verification failed")
+        core.logger.info("✅ database schema verification complete")
     except Exception as exc:
-        core.logger.exception("❌ startup database migration failed: %s", exc)
+        core.logger.exception("❌ required database migration failed: %s", exc)
+        raise RuntimeError("DinoBot database migration failed; refusing partial startup") from exc
 
-    # core.bot must exist before this installer is called. Keep a defensive
-    # guard so a future import-order change does not crash the whole web app.
     bot = getattr(core, "bot", None)
     if bot is None:
         core.logger.error("❌ startup_fixes: core.bot is unavailable; skipping Discord idempotency patch.")
@@ -56,37 +58,22 @@ def install(core):
             if name and bot.get_cog(name) is not None:
                 core.logger.warning("Cog '%s' already loaded; skipping duplicate load.", name)
                 return
-
             try:
                 cog_commands = list(cog.get_app_commands())
             except Exception:
                 cog_commands = []
-
             if cog_commands:
-                existing = [
-                    cmd for cmd in cog_commands
-                    if bot.tree.get_command(cmd.name) is not None
-                ]
+                existing = [cmd for cmd in cog_commands if bot.tree.get_command(cmd.name) is not None]
                 if len(existing) == len(cog_commands):
-                    core.logger.warning(
-                        "All application commands for Cog '%s' are already registered; skipping duplicate Cog.",
-                        name or "unknown",
-                    )
+                    core.logger.warning("All application commands for Cog '%s' are already registered; skipping duplicate Cog.", name or "unknown")
                     return
-
             try:
                 return await original_add_cog(cog, override=override)
             except Exception as exc:
                 if "already registered" in str(exc).lower() and cog_commands:
-                    existing = [
-                        cmd for cmd in cog_commands
-                        if bot.tree.get_command(cmd.name) is not None
-                    ]
+                    existing = [cmd for cmd in cog_commands if bot.tree.get_command(cmd.name) is not None]
                     if len(existing) == len(cog_commands):
-                        core.logger.warning(
-                            "Recovered duplicate command registration for Cog '%s'.",
-                            name or "unknown",
-                        )
+                        core.logger.warning("Recovered duplicate command registration for Cog '%s'.", name or "unknown")
                         return
                 raise
 
@@ -100,6 +87,5 @@ def install(core):
 
     if not has_route("/dashboard/login") and hasattr(core, "dashboard_login"):
         app.add_api_route("/dashboard/login", core.dashboard_login, methods=["GET"])
-
     if not has_route("/dashboard") and hasattr(core, "dashboard_home"):
         app.add_api_route("/dashboard", core.dashboard_home, methods=["GET"])
