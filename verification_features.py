@@ -2,18 +2,61 @@
 """Verification message cleanup and automatic verification-role assignment."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
+import hmac
+import json
 import logging
 import os
-from urllib.parse import urlencode
+import time
 
 import discord
 import httpx
 from discord import app_commands
-from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 log = logging.getLogger("DinoBot.Verification")
+
+
+def _oauth_secret() -> bytes:
+    return (os.getenv("SESSION_SECRET") or os.getenv("DISCORD_CLIENT_SECRET") or "").encode("utf-8")
+
+
+def _make_verify_state(guild_id: int) -> str:
+    """Create a short-lived, signed state so the guild cannot be changed by a user."""
+    payload = {
+        "v": 1,
+        "purpose": "verification",
+        "guild_id": str(guild_id),
+        "iat": int(time.time()),
+        "nonce": base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("="),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    secret = _oauth_secret()
+    if not secret:
+        raise RuntimeError("SESSION_SECRET 또는 DISCORD_CLIENT_SECRET이 필요합니다.")
+    sig = hmac.new(secret, raw, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(raw + b"." + sig).decode().rstrip("=")
+
+
+def _verify_state(state: str, max_age: int = 600) -> int | None:
+    try:
+        rawsig = base64.urlsafe_b64decode(state + "=" * (-len(state) % 4))
+        raw, sig = rawsig.rsplit(b".", 1)
+        secret = _oauth_secret()
+        if not secret or not hmac.compare_digest(hmac.new(secret, raw, hashlib.sha256).digest(), sig):
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+        age = int(time.time()) - int(payload["iat"])
+        if payload.get("v") != 1 or payload.get("purpose") != "verification":
+            return None
+        if age < 0 or age > max_age or not payload.get("nonce"):
+            return None
+        guild_id = int(payload["guild_id"])
+        return guild_id if guild_id > 0 else None
+    except Exception:
+        return None
 
 
 def install(core) -> None:
@@ -151,22 +194,25 @@ def install(core) -> None:
             return False, "역할 부여 중 Discord API 오류가 발생했습니다."
 
     # ------------------------------------------------------------------
-    # Replace the legacy /auth/callback with a callback that also assigns
-    # the configured role. The old route is left in core.py for compatibility
-    # but this route is promoted to the front of FastAPI's router.
+    # Verification callback. REDIRECT_URI is reserved for dashboard OAuth;
+    # verification uses its own registered callback URI.
     # ------------------------------------------------------------------
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
-    redirect_uri = os.getenv("REDIRECT_URI", "").strip() or core.REDIRECT_URI
+    redirect_uri = os.getenv("VERIFY_REDIRECT_URI", "").strip() or os.getenv("DINO_PUBLIC_BASE_URL", "").rstrip("/") + "/auth/callback"
 
     @app.get("/auth/callback", response_class=HTMLResponse)
-    async def verification_callback(request: Request):
+    async def verification_callback(request):
         code = request.query_params.get("code", "").strip()
         state = request.query_params.get("state", "").strip()
         if not code:
             return HTMLResponse("인증 코드가 없습니다.", status_code=400)
         if not client_id or not client_secret or not redirect_uri:
             return HTMLResponse("OAuth 설정이 올바르지 않습니다.", status_code=500)
+
+        guild_id = _verify_state(state)
+        if guild_id is None:
+            return HTMLResponse("인증 요청이 만료되었거나 유효하지 않습니다. 다시 인증해주세요.", status_code=400)
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -192,7 +238,7 @@ def install(core) -> None:
                 me_resp = await client.get("https://discord.com/api/users/@me", headers=headers)
                 me_resp.raise_for_status()
                 me = me_resp.json()
-        except Exception as exc:
+        except Exception:
             log.exception("verification OAuth callback failed")
             return HTMLResponse(
                 "<h2>인증 실패</h2><p>Discord 인증 처리 중 오류가 발생했습니다. 다시 시도해주세요.</p>",
@@ -200,40 +246,34 @@ def install(core) -> None:
             )
 
         user_id = int(me["id"])
-        guild_id = int(state) if state.isdigit() else None
-        role_message = ""
-        role_ok = True
-
-        if guild_id:
-            await DB.execute(
-                """
-                INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                    access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token
-                """,
-                guild_id,
-                user_id,
-                access_token,
-                refresh_token,
-            )
-            role_ok, role_message = await assign_verify_role(guild_id, user_id)
-
+        await DB.execute(
+            """
+            INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token
+            """,
+            guild_id,
+            user_id,
+            access_token,
+            refresh_token,
+        )
+        role_ok, role_message = await assign_verify_role(guild_id, user_id)
         display_name = html.escape(me.get("global_name") or me.get("username") or "사용자")
-        if guild_id and role_message:
+
+        if role_message:
             result = html.escape(role_message)
             status = "인증 완료" if role_ok else "인증 완료 · 역할 부여 실패"
-            return HTMLResponse(
-                f"<!doctype html><html lang='ko'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                f"<title>DinoBot · {status}</title><body style='font-family:system-ui;max-width:520px;margin:80px auto;padding:24px;text-align:center'>"
-                f"<h1>{status}</h1><p>{display_name}님의 Discord 인증이 완료되었습니다.</p><p>{result}</p><p>이 창을 닫아도 됩니다.</p></body></html>"
-            )
+        else:
+            result = ""
+            status = "인증 완료"
 
         return HTMLResponse(
             f"<!doctype html><html lang='ko'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<title>DinoBot · 인증 완료</title><body style='font-family:system-ui;max-width:520px;margin:80px auto;padding:24px;text-align:center'>"
-            f"<h1>인증 완료</h1><p>{display_name}님의 Discord 인증이 완료되었습니다.</p><p>이 창을 닫아도 됩니다.</p></body></html>"
+            f"<title>DinoBot · {status}</title><body style='font-family:system-ui;max-width:520px;margin:80px auto;padding:24px;text-align:center'>"
+            f"<h1>{status}</h1><p>{display_name}님의 Discord 인증이 완료되었습니다.</p>"
+            f"<p>{result}</p><p>이 창을 닫아도 됩니다.</p></body></html>"
         )
 
     # FastAPI uses first-match routing, so make the replacement callback win.
