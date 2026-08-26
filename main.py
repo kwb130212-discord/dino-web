@@ -2,9 +2,9 @@
 """DinoBot production entrypoint."""
 import os
 
-# One canonical public origin. Override this in Render with DINO_PUBLIC_BASE_URL
-# when a custom domain is used; otherwise use the current Render URL.
-PRODUCTION_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dino-web-2trw.onrender.com").rstrip("/")
+# Canonical public origin used by OAuth, dashboard links and external callbacks.
+# Keep this identical to the Discord Developer Portal redirect configuration.
+PRODUCTION_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 os.environ["REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
 os.environ["DASHBOARD_REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
