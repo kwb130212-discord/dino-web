@@ -3,7 +3,12 @@
 import os
 
 # Single canonical public origin for OAuth, dashboard links and callbacks.
-PRODUCTION_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
+# Keep the Render deployment as the safe default; a custom domain can still be
+# supplied through DINO_PUBLIC_BASE_URL in Render Environment Variables.
+PRODUCTION_BASE_URL = os.getenv(
+    "DINO_PUBLIC_BASE_URL",
+    "https://dino-web-2trw.onrender.com",
+).rstrip("/")
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 os.environ["REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
 os.environ["DASHBOARD_REDIRECT_URI"] = f"{PRODUCTION_BASE_URL}/dashboard/callback"
