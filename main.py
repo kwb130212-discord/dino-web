@@ -28,15 +28,21 @@ os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 
-# REDIRECT_URI is intentionally controlled by the Render environment variable.
-# Do not generate or silently replace it with another domain/path.
-if not os.getenv("REDIRECT_URI", "").strip():
+# REDIRECT_URI is the single source of truth for the dashboard Discord OAuth
+# callback. It must exactly match the URI registered in Discord Developer Portal.
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip().rstrip("/")
+if not REDIRECT_URI:
     raise RuntimeError("REDIRECT_URI 환경변수가 설정되지 않았습니다.")
-os.environ["REDIRECT_URI"] = os.getenv("REDIRECT_URI", "").strip()
+if not REDIRECT_URI.endswith("/dashboard/callback"):
+    raise RuntimeError("REDIRECT_URI는 /dashboard/callback으로 끝나야 합니다.")
+os.environ["REDIRECT_URI"] = REDIRECT_URI
 
-# Dashboard/trial callbacks remain separately configurable because Discord
-# requires an exact callback URI for each OAuth flow.
-os.environ.setdefault("DASHBOARD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback")
+# Keep legacy internal names synchronized with REDIRECT_URI so older dashboard
+# code cannot accidentally use a different callback URI.
+os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
+
+# Trial OAuth is a separate flow and callback. It remains configurable because
+# it is a distinct Discord OAuth redirect URI.
 os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
 
 import uvicorn
