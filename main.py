@@ -4,16 +4,8 @@ import os
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-# Prefer the custom production domain. If it is unreachable at boot, fall back
-# to the Render domain so the service can still generate working links/OAuth URLs.
-PRIMARY_BASE_URL = os.getenv(
-    "DINO_PRIMARY_BASE_URL",
-    "https://dinobotservice.64bit.kr",
-).rstrip("/")
-FALLBACK_BASE_URL = os.getenv(
-    "DINO_FALLBACK_BASE_URL",
-    "https://dino-web-2trw.onrender.com",
-).rstrip("/")
+PRIMARY_BASE_URL = os.getenv("DINO_PRIMARY_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
+FALLBACK_BASE_URL = os.getenv("DINO_FALLBACK_BASE_URL", "https://dino-web-2trw.onrender.com").rstrip("/")
 
 
 def _is_reachable(url: str) -> bool:
@@ -24,8 +16,6 @@ def _is_reachable(url: str) -> bool:
     except (HTTPError, URLError, TimeoutError, OSError):
         return False
 
-# Explicit DINO_PUBLIC_BASE_URL always wins. Otherwise prefer the custom domain,
-# then transparently use Render when the custom domain is unavailable.
 configured_base = os.getenv("DINO_PUBLIC_BASE_URL", "").strip().rstrip("/")
 if configured_base:
     PRODUCTION_BASE_URL = configured_base
@@ -38,8 +28,14 @@ os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 
-# Keep each Discord OAuth flow on its own callback path.
-os.environ.setdefault("REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback")
+# REDIRECT_URI is intentionally controlled by the Render environment variable.
+# Do not generate or silently replace it with another domain/path.
+if not os.getenv("REDIRECT_URI", "").strip():
+    raise RuntimeError("REDIRECT_URI 환경변수가 설정되지 않았습니다.")
+os.environ["REDIRECT_URI"] = os.getenv("REDIRECT_URI", "").strip()
+
+# Dashboard/trial callbacks remain separately configurable because Discord
+# requires an exact callback URI for each OAuth flow.
 os.environ.setdefault("DASHBOARD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback")
 os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
 
@@ -60,8 +56,8 @@ from dashboard_device_v3 import install as install_dashboard_device
 from auth_settings import install as install_auth_settings
 from dashboard_v4 import install as install_dashboard_v4
 from ip_analyzer import install as install_ip_analyzer
+from verification_features import install as install_verification_features
 
-# Boot order matters: schema first, security second, then routes/features.
 install_startup_fixes(core)
 install_security_hardening(core)
 install_web_entry(core)
@@ -77,6 +73,7 @@ install_dashboard_device(core)
 install_auth_settings(core)
 install_dashboard_v4(core)
 install_ip_analyzer(core)
+install_verification_features(core)
 
 app = core.app
 bot = core.bot
