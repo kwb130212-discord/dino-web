@@ -1,19 +1,15 @@
-# DinoBot 데이터 보존 정책
+# DinoBot 데이터 보존 및 보안 정책
 
 DinoBot의 서버 설정, 티켓, 상점, 거래, 포인트, 라이센스, 복구키 등 운영 데이터는 **Git 저장소가 아니라 PostgreSQL (`DATABASE_URL`)** 에 저장됩니다.
 
 ## 코드 수정/재배포 시
 
-- `CREATE TABLE IF NOT EXISTS`와 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 방식의 비파괴 마이그레이션만 사용합니다.
-- `DROP TABLE`, `TRUNCATE`, 전체 데이터 삭제 마이그레이션을 배포 코드에 사용하지 않습니다.
-- `legacy_main.py`는 호환성/기존 기능 보존용으로 유지합니다.
-- 새 기능은 가능한 한 별도 모듈로 추가하여 기존 데이터 구조를 직접 교체하지 않습니다.
+- `CREATE TABLE IF NOT EXISTS`와 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 방식의 비파괴 마이그레이션을 사용합니다.
+- 필수 migration 실패 시 부분적으로 부팅하지 않고 startup을 중단합니다.
+- Git 저장소에는 사용자 데이터, OAuth 토큰, 복구키 원문을 저장하지 않습니다.
+- 복구키는 HMAC digest로 저장하며, Discord OAuth access/refresh token은 암호화된 상태로 저장합니다.
 
-## Render 운영 시 필수
-
-Render Web Service의 디스크는 데이터베이스 대용으로 사용하지 않습니다. `DATABASE_URL`은 외부 PostgreSQL/Supabase 등 영속 DB를 가리켜야 합니다.
-
-필수 환경변수 예시:
+## Render 운영 시 필수 환경변수
 
 ```text
 DATABASE_URL=postgresql://...
@@ -21,11 +17,18 @@ DISCORD_TOKEN=...
 DISCORD_CLIENT_ID=...
 DISCORD_CLIENT_SECRET=...
 SESSION_SECRET=고정된-랜덤-문자열
-REDIRECT_URI=https://<render-domain>/auth/callback
-DASHBOARD_REDIRECT_URI=https://<render-domain>/dashboard/callback
+TOKEN_ENCRYPTION_KEY=고정된-랜덤-문자열
+RECOVERY_KEY_PEPPER=고정된-랜덤-문자열
+DINO_PUBLIC_BASE_URL=https://dinobotservice.64bit.kr
 ```
 
-`SESSION_SECRET`은 재배포마다 새 값이 되지 않도록 반드시 Render Environment Variables에 고정해 주세요.
+`SESSION_SECRET`, `TOKEN_ENCRYPTION_KEY`, `RECOVERY_KEY_PEPPER`는 재배포마다 바뀌지 않도록 Render Environment Variables에 고정해 주세요. 특히 `TOKEN_ENCRYPTION_KEY`가 바뀌면 기존 암호화 토큰을 복호화할 수 없습니다.
+
+OAuth callback은 코드에서 `DINO_PUBLIC_BASE_URL/dashboard/callback`으로 계산되므로 Discord Developer Portal의 Redirect URI와 정확히 일치해야 합니다.
+
+## 데이터 보존
+
+Render Web Service의 ephemeral filesystem은 데이터베이스 대용으로 사용하지 않습니다. `DATABASE_URL`은 외부 PostgreSQL/Supabase 등 영속 DB를 가리켜야 합니다.
 
 ## 기능 배치 원칙
 
