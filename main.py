@@ -1,19 +1,44 @@
 # -*- coding: utf-8 -*-
 """DinoBot production entrypoint."""
 import os
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
-# Single canonical public origin for OAuth, dashboard links and callbacks.
-# A custom domain can still be supplied through DINO_PUBLIC_BASE_URL.
-PRODUCTION_BASE_URL = os.getenv(
-    "DINO_PUBLIC_BASE_URL",
+# Prefer the custom production domain. If it is unreachable at boot, fall back
+# to the Render domain so the service can still generate working links/OAuth URLs.
+PRIMARY_BASE_URL = os.getenv(
+    "DINO_PRIMARY_BASE_URL",
+    "https://dinobotservice.64bit.kr",
+).rstrip("/")
+FALLBACK_BASE_URL = os.getenv(
+    "DINO_FALLBACK_BASE_URL",
     "https://dino-web-2trw.onrender.com",
 ).rstrip("/")
+
+
+def _is_reachable(url: str) -> bool:
+    try:
+        req = Request(url + "/", method="HEAD", headers={"User-Agent": "DinoBot/1.0"})
+        with urlopen(req, timeout=3) as response:
+            return response.status < 500
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return False
+
+# Explicit DINO_PUBLIC_BASE_URL always wins. Otherwise prefer the custom domain,
+# then transparently use Render when the custom domain is unavailable.
+configured_base = os.getenv("DINO_PUBLIC_BASE_URL", "").strip().rstrip("/")
+if configured_base:
+    PRODUCTION_BASE_URL = configured_base
+elif _is_reachable(PRIMARY_BASE_URL):
+    PRODUCTION_BASE_URL = PRIMARY_BASE_URL
+else:
+    PRODUCTION_BASE_URL = FALLBACK_BASE_URL
+
+os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
+os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 
 # Keep each Discord OAuth flow on its own callback path.
-# Do NOT point REDIRECT_URI at /dashboard/callback: the bot's verification
-# buttons use /auth/callback, while the dashboard and trial flows have their
-# own callback endpoints.
 os.environ.setdefault("REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback")
 os.environ.setdefault("DASHBOARD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback")
 os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
