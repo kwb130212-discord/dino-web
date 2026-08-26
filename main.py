@@ -24,7 +24,6 @@ from dashboard_servers_v2 import install as install_dashboard_servers
 from dashboard_device_v3 import install as install_dashboard_device
 from auth_settings import install as install_auth_settings
 from dashboard_v4 import install as install_dashboard_v4
-from keepalive import install as install_keepalive
 from ip_analyzer import install as install_ip_analyzer
 
 # Boot order matters: schema first, security second, then routes/features.
@@ -42,7 +41,6 @@ install_dashboard_servers(core)
 install_dashboard_device(core)
 install_auth_settings(core)
 install_dashboard_v4(core)
-install_keepalive(core)
 install_ip_analyzer(core)
 
 app = core.app
