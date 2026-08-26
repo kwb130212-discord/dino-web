@@ -22,13 +22,11 @@ CANONICAL_REDIRECT_URI = f"{PUBLIC_BASE_URL}/dashboard/callback"
 
 
 def _state_secret() -> bytes:
-    # Prefer the stable production SESSION_SECRET. A stable secret is required
-    # across Render restarts; without it, login state is intentionally invalidated.
     return (os.getenv("SESSION_SECRET") or os.getenv("DISCORD_CLIENT_SECRET") or "").encode("utf-8")
 
 
 def _make_state() -> str:
-    payload = {"v": 1, "iat": int(time.time()), "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")}
+    payload = {"v": 2, "iat": int(time.time()), "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")}
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     secret = _state_secret()
     if not secret:
@@ -45,9 +43,13 @@ def _verify_state(state: str, max_age: int = 600) -> bool:
         if not secret or not hmac.compare_digest(hmac.new(secret, raw, hashlib.sha256).digest(), sig):
             return False
         payload = json.loads(raw.decode())
-        return payload.get("v") == 1 and 0 <= int(time.time()) - int(payload["iat"]) <= max_age
+        return payload.get("v") == 2 and 0 <= int(time.time()) - int(payload["iat"]) <= max_age and bool(payload.get("nonce"))
     except Exception:
         return False
+
+
+def _state_fingerprint(state: str) -> str:
+    return hashlib.sha256(state.encode("utf-8")).hexdigest()
 
 
 def install(core) -> None:
@@ -82,9 +84,10 @@ def install(core) -> None:
         except RuntimeError as exc:
             log.error("OAuth state secret unavailable: %s", exc)
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 환경변수를 설정해 주세요.</p></main></div>')
-        # Keep a copy for diagnostics/backward compatibility, but callback
-        # validation does not depend on the browser carrying the old session cookie.
-        request.session["oauth_state"] = state
+        # Bind this exact OAuth transaction to the browser session. A signed
+        # state alone prevents tampering but does not stop login-CSRF attacks.
+        request.session["oauth_state_hash"] = _state_fingerprint(state)
+        request.session["oauth_state_issued_at"] = int(time.time())
         params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": "identify guilds", "state": state, "prompt": "consent"}
         auth_url = "https://discord.com/oauth2/authorize?" + urlencode(params)
         oauth_diag(request, "authorize_url_created", authorize_redirect_uri=redirect_uri, oauth_scope="identify guilds")
@@ -96,10 +99,20 @@ def install(core) -> None:
         state = request.query_params.get("state", "")
         oauth_diag(request, "callback_received", code_present=bool(request.query_params.get("code")), state_present=bool(state), discord_error=request.query_params.get("error", ""))
         if request.query_params.get("error"):
+            request.session.pop("oauth_state_hash", None)
+            request.session.pop("oauth_state_issued_at", None)
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">Discord 인증 거부</h1><p class="desc">Discord가 OAuth 요청을 거부했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
-        if not state or not _verify_state(state):
-            log.warning("[OAUTH-DIAG] stage='state_verification_failed' state_present=%s", bool(state))
+        expected = request.session.get("oauth_state_hash")
+        issued_at = int(request.session.get("oauth_state_issued_at") or 0)
+        session_state_ok = bool(expected and state and hmac.compare_digest(str(expected), _state_fingerprint(state)))
+        session_age_ok = bool(issued_at and 0 <= int(time.time()) - issued_at <= 600)
+        if not state or not _verify_state(state) or not session_state_ok or not session_age_ok:
+            log.warning("[OAUTH-DIAG] stage='state_verification_failed' state_present=%s session_state_ok=%s session_age_ok=%s", bool(state), session_state_ok, session_age_ok)
+            request.session.pop("oauth_state_hash", None)
+            request.session.pop("oauth_state_issued_at", None)
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">OAuth State 오류</h1><p class="desc">인증 세션이 일치하지 않습니다. 다시 로그인해 주세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
+        request.session.pop("oauth_state_hash", None)
+        request.session.pop("oauth_state_issued_at", None)
         code = request.query_params.get("code")
         if not code or not client_id or not client_secret:
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">필수 인증 설정이 없습니다.</p></main></div>')
