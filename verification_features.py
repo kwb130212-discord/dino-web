@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+from urllib.parse import urlencode
 
 import discord
 import httpx
@@ -24,7 +25,6 @@ def _oauth_secret() -> bytes:
 
 
 def _make_verify_state(guild_id: int) -> str:
-    """Create a short-lived, signed state so the guild cannot be changed by a user."""
     payload = {
         "v": 1,
         "purpose": "verification",
@@ -59,11 +59,36 @@ def _verify_state(state: str, max_age: int = 600) -> int | None:
         return None
 
 
+class VerificationView(discord.ui.View):
+    """Verification link view using the dedicated verification callback."""
+
+    def __init__(self, guild_id: int | None = None, button_label: str | None = None):
+        super().__init__(timeout=None)
+        client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
+        redirect_uri = os.getenv("VERIFY_REDIRECT_URI", "").strip()
+        if not redirect_uri:
+            redirect_uri = os.getenv("DINO_PUBLIC_BASE_URL", "").rstrip("/") + "/auth/callback"
+        button_label = str(button_label or "인증하기").strip() or "인증하기"
+
+        params = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "identify guilds.join",
+        }
+        if guild_id:
+            params["state"] = _make_verify_state(guild_id)
+        oauth_url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
+        self.add_item(discord.ui.Button(label=button_label, style=discord.ButtonStyle.link, url=oauth_url))
+
+
 def install(core) -> None:
     app, bot, DB = core.app, core.bot, core.DB
 
-    # Keep the dashboard/modal description exactly as the administrator enters it.
-    # Remove the old hard-coded security/recovery warning from the modal defaults.
+    # All newly generated verification messages use the dedicated verification
+    # callback instead of the dashboard REDIRECT_URI.
+    core.VerifyView = VerificationView
+
     try:
         core.VerifySettingsModal.description_text.default = ""
         core.VerifySettingsModal.description_text.placeholder = "표시할 설명을 입력하세요."
@@ -102,9 +127,6 @@ def install(core) -> None:
     except Exception:
         log.exception("verification modal cleanup patch failed")
 
-    # ------------------------------------------------------------------
-    # /인증역할설정 @역할
-    # ------------------------------------------------------------------
     @app_commands.command(name="인증역할설정", description="인증 완료 시 자동으로 부여할 역할을 설정합니다.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
@@ -112,7 +134,6 @@ def install(core) -> None:
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-
         if not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
 
@@ -147,7 +168,6 @@ def install(core) -> None:
     bot.tree.add_command(set_verify_role)
 
     async def assign_verify_role(guild_id: int, user_id: int) -> tuple[bool, str]:
-        """Assign the configured role after a successful Discord OAuth verification."""
         row = await DB.fetchone(
             "SELECT verify_role_id FROM guild_settings WHERE guild_id=%s",
             guild_id,
@@ -181,9 +201,9 @@ def install(core) -> None:
             return False, "설정된 인증 역할을 사용할 수 없습니다."
         if role >= me.top_role:
             return False, "인증 역할이 봇의 최고 역할보다 높습니다."
-
         if role in member.roles:
             return True, "이미 인증 역할이 부여되어 있습니다."
+
         try:
             await member.add_roles(role, reason="DinoBot Discord 인증 완료")
             return True, "인증 역할이 부여되었습니다."
@@ -193,10 +213,6 @@ def install(core) -> None:
             log.exception("failed to assign verification role guild=%s user=%s role=%s", guild_id, user_id, role_id)
             return False, "역할 부여 중 Discord API 오류가 발생했습니다."
 
-    # ------------------------------------------------------------------
-    # Verification callback. REDIRECT_URI is reserved for dashboard OAuth;
-    # verification uses its own registered callback URI.
-    # ------------------------------------------------------------------
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
     redirect_uri = os.getenv("VERIFY_REDIRECT_URI", "").strip() or os.getenv("DINO_PUBLIC_BASE_URL", "").rstrip("/") + "/auth/callback"
@@ -233,7 +249,6 @@ def install(core) -> None:
                 refresh_token = token_data.get("refresh_token")
                 if not access_token:
                     raise RuntimeError("Discord token response did not contain access_token")
-
                 headers = {"Authorization": f"Bearer {access_token}"}
                 me_resp = await client.get("https://discord.com/api/users/@me", headers=headers)
                 me_resp.raise_for_status()
@@ -261,13 +276,8 @@ def install(core) -> None:
         )
         role_ok, role_message = await assign_verify_role(guild_id, user_id)
         display_name = html.escape(me.get("global_name") or me.get("username") or "사용자")
-
-        if role_message:
-            result = html.escape(role_message)
-            status = "인증 완료" if role_ok else "인증 완료 · 역할 부여 실패"
-        else:
-            result = ""
-            status = "인증 완료"
+        status = "인증 완료" if role_ok else "인증 완료 · 역할 부여 실패"
+        result = html.escape(role_message) if role_message else ""
 
         return HTMLResponse(
             f"<!doctype html><html lang='ko'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -276,7 +286,6 @@ def install(core) -> None:
             f"<p>{result}</p><p>이 창을 닫아도 됩니다.</p></body></html>"
         )
 
-    # FastAPI uses first-match routing, so make the replacement callback win.
     for route in list(app.router.routes):
         if getattr(route, "path", "") == "/auth/callback" and route.endpoint is not verification_callback:
             try:
