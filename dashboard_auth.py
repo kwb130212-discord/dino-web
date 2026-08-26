@@ -17,8 +17,12 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 log = logging.getLogger("DinoBot.Auth")
-PUBLIC_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
-CANONICAL_REDIRECT_URI = f"{PUBLIC_BASE_URL}/dashboard/callback"
+
+# Discord OAuth redirect URI is intentionally controlled by the environment.
+# It must exactly match the URI registered in the Discord Developer Portal.
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip().rstrip("/")
+if not REDIRECT_URI:
+    raise RuntimeError("REDIRECT_URI 환경변수가 설정되지 않았습니다.")
 
 
 def _state_secret() -> bytes:
@@ -56,7 +60,7 @@ def install(core) -> None:
     app = core.app
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
-    redirect_uri = CANONICAL_REDIRECT_URI
+    redirect_uri = REDIRECT_URI
 
     def oauth_diag(request: Request, stage: str, **extra):
         try:
@@ -84,8 +88,6 @@ def install(core) -> None:
         except RuntimeError as exc:
             log.error("OAuth state secret unavailable: %s", exc)
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 환경변수를 설정해 주세요.</p></main></div>')
-        # Bind this exact OAuth transaction to the browser session. A signed
-        # state alone prevents tampering but does not stop login-CSRF attacks.
         request.session["oauth_state_hash"] = _state_fingerprint(state)
         request.session["oauth_state_issued_at"] = int(time.time())
         params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": "identify guilds", "state": state, "prompt": "consent"}
