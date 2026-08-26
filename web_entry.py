@@ -4,10 +4,11 @@
 Keeps the service root friendly while the existing health/status endpoint can
 remain machine-readable. OAuth itself lives in dashboard_auth.py.
 """
+import os
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-BASE_URL = "https://dino-web-2trw.onrender.com"
+BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dino-web-2trw.onrender.com").rstrip("/")
 
 
 def _front(app, route):
