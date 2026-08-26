@@ -8,7 +8,8 @@ import os
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dino-web-2trw.onrender.com").rstrip("/")
+# Must match the OAuth callback origin configured in main.py and Discord.
+BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
 
 
 def _front(app, route):
