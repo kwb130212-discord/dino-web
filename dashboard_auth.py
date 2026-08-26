@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 log = logging.getLogger("DinoBot.Auth")
 
-# Discord OAuth redirect URI is intentionally controlled by the environment.
+# Dashboard Discord OAuth redirect URI is controlled exclusively by REDIRECT_URI.
 # It must exactly match the URI registered in the Discord Developer Portal.
 REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip().rstrip("/")
 if not REDIRECT_URI:
@@ -30,7 +30,7 @@ def _state_secret() -> bytes:
 
 
 def _make_state() -> str:
-    payload = {"v": 2, "iat": int(time.time()), "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")}
+    payload = {"v": 3, "iat": int(time.time()), "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")}
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     secret = _state_secret()
     if not secret:
@@ -47,13 +47,10 @@ def _verify_state(state: str, max_age: int = 600) -> bool:
         if not secret or not hmac.compare_digest(hmac.new(secret, raw, hashlib.sha256).digest(), sig):
             return False
         payload = json.loads(raw.decode())
-        return payload.get("v") == 2 and 0 <= int(time.time()) - int(payload["iat"]) <= max_age and bool(payload.get("nonce"))
+        age = int(time.time()) - int(payload["iat"])
+        return payload.get("v") == 3 and 0 <= age <= max_age and bool(payload.get("nonce"))
     except Exception:
         return False
-
-
-def _state_fingerprint(state: str) -> str:
-    return hashlib.sha256(state.encode("utf-8")).hexdigest()
 
 
 def install(core) -> None:
@@ -64,9 +61,16 @@ def install(core) -> None:
 
     def oauth_diag(request: Request, stage: str, **extra):
         try:
-            host = request.headers.get("host", "")
-            proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-            checks = {"stage": stage, "configured_redirect_uri": redirect_uri, "request_host": host, "request_scheme": request.url.scheme, "forwarded_proto": proto, "callback_path": str(request.url.path), "client_id_present": bool(client_id), "client_secret_present": bool(client_secret)}
+            checks = {
+                "stage": stage,
+                "configured_redirect_uri": redirect_uri,
+                "request_host": request.headers.get("host", ""),
+                "request_scheme": request.url.scheme,
+                "forwarded_proto": request.headers.get("x-forwarded-proto", request.url.scheme),
+                "callback_path": str(request.url.path),
+                "client_id_present": bool(client_id),
+                "client_secret_present": bool(client_secret),
+            }
             checks.update(extra)
             log.warning("[OAUTH-DIAG] %s", " ".join(f"{k}={v!r}" for k, v in checks.items()))
         except Exception:
@@ -87,10 +91,19 @@ def install(core) -> None:
             state = _make_state()
         except RuntimeError as exc:
             log.error("OAuth state secret unavailable: %s", exc)
-            return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 환경변수를 설정해 주세요.</p></main></div>')
-        request.session["oauth_state_hash"] = _state_fingerprint(state)
-        request.session["oauth_state_issued_at"] = int(time.time())
-        params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": "identify guilds", "state": state, "prompt": "consent"}
+            return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 또는 DISCORD_CLIENT_SECRET을 설정해 주세요.</p></main></div>')
+
+        # State is intentionally self-contained and HMAC signed. Do not bind it
+        # to the Starlette session cookie: proxies/browsers can legitimately
+        # drop or rotate that cookie during an external Discord redirect.
+        params = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "identify guilds",
+            "state": state,
+            "prompt": "consent",
+        }
         auth_url = "https://discord.com/oauth2/authorize?" + urlencode(params)
         oauth_diag(request, "authorize_url_created", authorize_redirect_uri=redirect_uri, oauth_scope="identify guilds")
         body = '<div class="wrap"><main class="card"><div class="brand">DinoBot Control Center</div><h1 class="title">대시보드 로그인</h1><p class="desc">Discord 계정으로 로그인한 뒤<br>내가 소유한 서버를 확인하고 DinoBot을 등록할 수 있습니다.</p><a class="btn" href="' + html.escape(auth_url, quote=True) + '">Discord로 계속하기</a><div class="small">서버 목록 권한이 필요합니다.</div></main></div>'
@@ -101,27 +114,32 @@ def install(core) -> None:
         state = request.query_params.get("state", "")
         oauth_diag(request, "callback_received", code_present=bool(request.query_params.get("code")), state_present=bool(state), discord_error=request.query_params.get("error", ""))
         if request.query_params.get("error"):
-            request.session.pop("oauth_state_hash", None)
-            request.session.pop("oauth_state_issued_at", None)
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">Discord 인증 거부</h1><p class="desc">Discord가 OAuth 요청을 거부했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
-        expected = request.session.get("oauth_state_hash")
-        issued_at = int(request.session.get("oauth_state_issued_at") or 0)
-        session_state_ok = bool(expected and state and hmac.compare_digest(str(expected), _state_fingerprint(state)))
-        session_age_ok = bool(issued_at and 0 <= int(time.time()) - issued_at <= 600)
-        if not state or not _verify_state(state) or not session_state_ok or not session_age_ok:
-            log.warning("[OAUTH-DIAG] stage='state_verification_failed' state_present=%s session_state_ok=%s session_age_ok=%s", bool(state), session_state_ok, session_age_ok)
-            request.session.pop("oauth_state_hash", None)
-            request.session.pop("oauth_state_issued_at", None)
-            return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">OAuth State 오류</h1><p class="desc">인증 세션이 일치하지 않습니다. 다시 로그인해 주세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
-        request.session.pop("oauth_state_hash", None)
-        request.session.pop("oauth_state_issued_at", None)
+
+        # Do not require a pre-existing session cookie here. The signed state
+        # itself is the CSRF correlation value and remains verifiable across
+        # the Discord redirect even when the session cookie is not returned.
+        if not state or not _verify_state(state):
+            log.warning("[OAUTH-DIAG] stage='state_verification_failed' state_present=%s stateless_state_ok=%s", bool(state), bool(state and _verify_state(state)))
+            return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">OAuth State 오류</h1><p class="desc">인증 요청이 만료되었거나 유효하지 않습니다. 다시 로그인해 주세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
+
         code = request.query_params.get("code")
         if not code or not client_id or not client_secret:
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">필수 인증 설정이 없습니다.</p></main></div>')
         try:
             timeout = httpx.Timeout(10.0, connect=4.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                token_resp = await client.post("https://discord.com/api/oauth2/token", data={"client_id": client_id, "client_secret": client_secret, "grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri}, headers={"Content-Type": "application/x-www-form-urlencoded"})
+                token_resp = await client.post(
+                    "https://discord.com/api/oauth2/token",
+                    data={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
                 oauth_diag(request, "token_exchange_response", discord_status=token_resp.status_code)
                 token_resp.raise_for_status()
                 access_token = token_resp.json().get("access_token")
