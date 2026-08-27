@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
-"""DinoBot production entrypoint."""
+"""DinoBot production entrypoint and canonical public URL configuration."""
 import os
 
-# Canonical public URL: Render service. Keep this identical to the Discord
-# Developer Portal OAuth redirect URI unless a custom domain is deliberately
-# configured there as well.
-PRIMARY_BASE_URL = "https://dino-web-2trw.onrender.com"
-FALLBACK_BASE_URL = "https://dino-web-2trw.onrender.com"
+# Canonical public origin. Discord OAuth2 must use this exact host and callback.
+PRIMARY_BASE_URL = "https://dinobotservice.64bit.kr"
+FALLBACK_BASE_URL = PRIMARY_BASE_URL
 PRODUCTION_BASE_URL = PRIMARY_BASE_URL
+
 os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
+
+# Keep all OAuth consumers on one canonical callback.
 REDIRECT_URI = f"{PRODUCTION_BASE_URL}/dashboard/callback"
 os.environ["REDIRECT_URI"] = REDIRECT_URI
 os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
+
 VERIFY_REDIRECT_URI = os.getenv("VERIFY_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback").strip().rstrip("/")
 os.environ["VERIFY_REDIRECT_URI"] = VERIFY_REDIRECT_URI
-os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
+os.environ["TRIAL_REDIRECT_URI"] = os.getenv("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback").strip().rstrip("/")
 
 import uvicorn
 import core
@@ -60,4 +62,10 @@ app = core.app
 bot = core.bot
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        proxy_headers=True,
+        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*")
+    )
