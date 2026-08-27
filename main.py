@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
-"""DinoBot production entrypoint."""
+"""DinoBot production entrypoint.
+
+Startup is deliberately small: configuration is normalized before importing
+modules that consume environment variables, then feature installers are loaded
+in a deterministic order.
+"""
+from __future__ import annotations
+
+import logging
 import os
 
-# Canonical public URL: Render service. Keep this identical to the Discord
-# Developer Portal OAuth redirect URI unless a custom domain is deliberately
-# configured there as well.
-PRIMARY_BASE_URL = "https://dino-web-2trw.onrender.com"
-FALLBACK_BASE_URL = "https://dino-web-2trw.onrender.com"
-PRODUCTION_BASE_URL = PRIMARY_BASE_URL
-os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
-os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
-os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-REDIRECT_URI = f"{PRODUCTION_BASE_URL}/dashboard/callback"
-os.environ["REDIRECT_URI"] = REDIRECT_URI
-os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
-VERIFY_REDIRECT_URI = os.getenv("VERIFY_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback").strip().rstrip("/")
-os.environ["VERIFY_REDIRECT_URI"] = VERIFY_REDIRECT_URI
-os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
+from production_config import apply_environment, validate, public_base_url, dashboard_redirect_uri
+
+# Environment must be normalized before importing core and feature modules.
+apply_environment()
 
 import uvicorn
 import core
@@ -38,26 +35,50 @@ from ip_analyzer import install as install_ip_analyzer
 from verification_features import install as install_verification_features
 from unified_control import install as install_unified_control
 
-install_startup_fixes(core)
-install_security_hardening(core)
-install_web_entry(core)
-install_dashboard_auth(core)
-install_control_center(core)
-install_tutorial_logs(core)
-install_ticket_control(core)
-install_persistent_settings(core)
-install_dashboard_shortcuts(core)
-install_webboard_features(core)
-install_dashboard_servers(core)
-install_dashboard_device(core)
-install_auth_settings(core)
-install_dashboard_v4(core)
-install_ip_analyzer(core)
-install_verification_features(core)
-install_unified_control(core)
+logger = logging.getLogger("DinoBot.Startup")
+
+
+def install_features() -> None:
+    """Install every feature exactly once in dependency order."""
+    installers = (
+        install_startup_fixes,
+        install_security_hardening,
+        install_web_entry,
+        install_dashboard_auth,
+        install_control_center,
+        install_tutorial_logs,
+        install_ticket_control,
+        install_persistent_settings,
+        install_dashboard_shortcuts,
+        install_webboard_features,
+        install_dashboard_servers,
+        install_dashboard_device,
+        install_auth_settings,
+        install_dashboard_v4,
+        install_ip_analyzer,
+        install_verification_features,
+        install_unified_control,
+    )
+    for installer in installers:
+        installer(core)
+
+
+# Keep deployment failures explicit instead of allowing a partially configured
+# process to start and fail later during the first OAuth request.
+validate()
+install_features()
 
 app = core.app
 bot = core.bot
 
+logger.info("DinoBot initialized: public_base=%s dashboard_redirect=%s", public_base_url(), dashboard_redirect_uri())
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        proxy_headers=True,
+        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"),
+        server_header=False,
+    )
