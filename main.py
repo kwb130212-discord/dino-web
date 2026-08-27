@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
-"""DinoBot production entrypoint."""
-import os
+"""DinoBot production entrypoint.
 
-# Canonical public URL: Render service. Keep this identical to the Discord
-# Developer Portal OAuth redirect URI unless a custom domain is deliberately
-# configured there as well.
-PRIMARY_BASE_URL = "https://dino-web-2trw.onrender.com"
-FALLBACK_BASE_URL = "https://dino-web-2trw.onrender.com"
-PRODUCTION_BASE_URL = PRIMARY_BASE_URL
-os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
-os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
-os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-REDIRECT_URI = f"{PRODUCTION_BASE_URL}/dashboard/callback"
-os.environ["REDIRECT_URI"] = REDIRECT_URI
-os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
-VERIFY_REDIRECT_URI = os.getenv("VERIFY_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback").strip().rstrip("/")
-os.environ["VERIFY_REDIRECT_URI"] = VERIFY_REDIRECT_URI
-os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
+Configuration is normalized before importing feature modules. Feature
+installation is explicit, deterministic, and fails with the responsible
+module name instead of leaving a partially initialized service running.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+
+from production_config import apply_environment, validate, public_base_url, dashboard_redirect_uri
+
+apply_environment()
 
 import uvicorn
 import core
@@ -38,26 +35,63 @@ from ip_analyzer import install as install_ip_analyzer
 from verification_features import install as install_verification_features
 from unified_control import install as install_unified_control
 
-install_startup_fixes(core)
-install_security_hardening(core)
-install_web_entry(core)
-install_dashboard_auth(core)
-install_control_center(core)
-install_tutorial_logs(core)
-install_ticket_control(core)
-install_persistent_settings(core)
-install_dashboard_shortcuts(core)
-install_webboard_features(core)
-install_dashboard_servers(core)
-install_dashboard_device(core)
-install_auth_settings(core)
-install_dashboard_v4(core)
-install_ip_analyzer(core)
-install_verification_features(core)
-install_unified_control(core)
+logger = logging.getLogger("DinoBot.Startup")
+
+INSTALLERS = (
+    ("startup_fixes", install_startup_fixes),
+    ("security_hardening", install_security_hardening),
+    ("web_entry", install_web_entry),
+    ("dashboard_auth", install_dashboard_auth),
+    ("control_center", install_control_center),
+    ("tutorial_logs", install_tutorial_logs),
+    ("ticket_control", install_ticket_control),
+    ("persistent_settings", install_persistent_settings),
+    ("dashboard_shortcuts", install_dashboard_shortcuts),
+    ("webboard_features_v3", install_webboard_features),
+    ("dashboard_servers_v2", install_dashboard_servers),
+    ("dashboard_device_v3", install_dashboard_device),
+    ("auth_settings", install_auth_settings),
+    ("dashboard_v4", install_dashboard_v4),
+    ("ip_analyzer", install_ip_analyzer),
+    ("verification_features", install_verification_features),
+    ("unified_control", install_unified_control),
+)
+
+
+def install_features() -> None:
+    """Install every feature once and identify failures precisely."""
+    installed: list[str] = []
+    for name, installer in INSTALLERS:
+        started = time.perf_counter()
+        try:
+            installer(core)
+            installed.append(name)
+            logger.info("feature_installed name=%s elapsed_ms=%.1f", name, (time.perf_counter() - started) * 1000)
+        except Exception:
+            logger.exception("feature_install_failed name=%s installed=%s", name, installed)
+            raise RuntimeError(f"Failed to install feature: {name}") from None
+
+
+validate()
+install_features()
 
 app = core.app
 bot = core.bot
 
+logger.info(
+    "DinoBot initialized public_base=%s dashboard_redirect=%s features=%d",
+    public_base_url(),
+    dashboard_redirect_uri(),
+    len(INSTALLERS),
+)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        proxy_headers=True,
+        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1"),
+        server_header=False,
+    )
