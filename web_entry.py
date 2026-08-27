@@ -4,9 +4,11 @@ import os
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-# Match main.py's canonical Render URL. This is intentionally not derived from
-# the incoming Host header, preventing proxy/host-header drift in OAuth flows.
-BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dino-web-2trw.onrender.com").rstrip("/")
+# One public origin for the entire production service. Never fall back to a
+# provider hostname here: OAuth redirect URIs must use the registered custom
+# domain exactly.
+BASE_URL = "https://dinobotservice.64bit.kr"
+os.environ["DINO_PUBLIC_BASE_URL"] = BASE_URL
 
 
 def _front(app, route):
@@ -39,7 +41,6 @@ def install(core) -> None:
 <div class='foot'>Secure Discord OAuth · DinoBot</div></main></body></html>"""
         )
 
-    # Render's health checker can use HEAD /. Keep this endpoint side-effect free.
     @app.head("/")
     async def web_home_head():
         return Response(status_code=200)
