@@ -2,31 +2,17 @@
 """DinoBot production entrypoint."""
 import os
 
-# Production dashboard OAuth callback is intentionally canonicalized here.
-# This prevents Render Environment Variables from accidentally switching the
-# Discord OAuth callback to the old *.onrender.com address.
 PRIMARY_BASE_URL = "https://dinobotservice.64bit.kr"
 FALLBACK_BASE_URL = "https://dino-web-2trw.onrender.com"
 PRODUCTION_BASE_URL = PRIMARY_BASE_URL
-
 os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-
-# Single source of truth for Dashboard Discord OAuth.
-# Discord Developer Portal must contain this exact URI.
 REDIRECT_URI = "https://dinobotservice.64bit.kr/dashboard/callback"
 os.environ["REDIRECT_URI"] = REDIRECT_URI
 os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
-
-# Verification is a separate OAuth flow.
-VERIFY_REDIRECT_URI = os.getenv(
-    "VERIFY_REDIRECT_URI",
-    f"{PRODUCTION_BASE_URL}/auth/callback",
-).strip().rstrip("/")
+VERIFY_REDIRECT_URI = os.getenv("VERIFY_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback").strip().rstrip("/")
 os.environ["VERIFY_REDIRECT_URI"] = VERIFY_REDIRECT_URI
-
-# Trial OAuth is also a separate flow.
 os.environ.setdefault("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback")
 
 import uvicorn
@@ -47,6 +33,7 @@ from auth_settings import install as install_auth_settings
 from dashboard_v4 import install as install_dashboard_v4
 from ip_analyzer import install as install_ip_analyzer
 from verification_features import install as install_verification_features
+from unified_control import install as install_unified_control
 
 install_startup_fixes(core)
 install_security_hardening(core)
@@ -64,6 +51,7 @@ install_auth_settings(core)
 install_dashboard_v4(core)
 install_ip_analyzer(core)
 install_verification_features(core)
+install_unified_control(core)
 
 app = core.app
 bot = core.bot
