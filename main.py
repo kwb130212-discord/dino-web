@@ -1,44 +1,25 @@
 # -*- coding: utf-8 -*-
 """DinoBot production entrypoint."""
 import os
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
-PRIMARY_BASE_URL = os.getenv("DINO_PRIMARY_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
-FALLBACK_BASE_URL = os.getenv("DINO_FALLBACK_BASE_URL", "https://dino-web-2trw.onrender.com").rstrip("/")
-
-
-def _is_reachable(url: str) -> bool:
-    try:
-        req = Request(url + "/", method="HEAD", headers={"User-Agent": "DinoBot/1.0"})
-        with urlopen(req, timeout=3) as response:
-            return response.status < 500
-    except (HTTPError, URLError, TimeoutError, OSError):
-        return False
-
-configured_base = os.getenv("DINO_PUBLIC_BASE_URL", "").strip().rstrip("/")
-if configured_base:
-    PRODUCTION_BASE_URL = configured_base
-elif _is_reachable(PRIMARY_BASE_URL):
-    PRODUCTION_BASE_URL = PRIMARY_BASE_URL
-else:
-    PRODUCTION_BASE_URL = FALLBACK_BASE_URL
+# Production dashboard OAuth callback is intentionally canonicalized here.
+# This prevents Render Environment Variables from accidentally switching the
+# Discord OAuth callback to the old *.onrender.com address.
+PRIMARY_BASE_URL = "https://dinobotservice.64bit.kr"
+FALLBACK_BASE_URL = "https://dino-web-2trw.onrender.com"
+PRODUCTION_BASE_URL = PRIMARY_BASE_URL
 
 os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 
-# REDIRECT_URI is the single source of truth for dashboard Discord OAuth.
-REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip().rstrip("/")
-if not REDIRECT_URI:
-    raise RuntimeError("REDIRECT_URI 환경변수가 설정되지 않았습니다.")
-if not REDIRECT_URI.endswith("/dashboard/callback"):
-    raise RuntimeError("REDIRECT_URI는 /dashboard/callback으로 끝나야 합니다.")
+# Single source of truth for Dashboard Discord OAuth.
+# Discord Developer Portal must contain this exact URI.
+REDIRECT_URI = "https://dinobotservice.64bit.kr/dashboard/callback"
 os.environ["REDIRECT_URI"] = REDIRECT_URI
 os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
 
-# Verification is a different OAuth flow and therefore needs its own Discord
-# callback registration. It must never reuse the dashboard REDIRECT_URI.
+# Verification is a separate OAuth flow.
 VERIFY_REDIRECT_URI = os.getenv(
     "VERIFY_REDIRECT_URI",
     f"{PRODUCTION_BASE_URL}/auth/callback",
