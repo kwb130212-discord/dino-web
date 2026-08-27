@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Centralized production configuration for DinoBot."""
+"""Single source of truth for DinoBot production configuration.
+
+The public custom domain is deliberately independent from the Render runtime
+hostname. Legacy modules receive normalized environment variables from here.
+"""
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 CANONICAL_BASE_URL = "https://dinobotservice.64bit.kr"
 DASHBOARD_CALLBACK_PATH = "/dashboard/callback"
@@ -15,44 +20,48 @@ def _clean_url(value: str) -> str:
 
 
 def public_base_url() -> str:
-    return _clean_url(os.getenv("DINO_PUBLIC_BASE_URL", CANONICAL_BASE_URL))
+    # The production origin is intentionally fixed. A deployment hostname must
+    # never silently change the OAuth origin.
+    configured = _clean_url(os.getenv("DINO_PUBLIC_BASE_URL", ""))
+    return configured or CANONICAL_BASE_URL
 
 
 def dashboard_redirect_uri() -> str:
-    return public_base_url() + DASHBOARD_CALLBACK_PATH
+    return CANONICAL_BASE_URL + DASHBOARD_CALLBACK_PATH
 
 
 def auth_redirect_uri() -> str:
-    return public_base_url() + AUTH_CALLBACK_PATH
+    return CANONICAL_BASE_URL + AUTH_CALLBACK_PATH
 
 
 def trial_redirect_uri() -> str:
-    return public_base_url() + TRIAL_CALLBACK_PATH
+    return CANONICAL_BASE_URL + TRIAL_CALLBACK_PATH
 
 
 def apply_environment() -> None:
-    """Publish one consistent set of URLs to legacy feature modules."""
-    base = public_base_url()
+    """Normalize configuration before importing modules that consume it."""
     values = {
-        "DINO_PRIMARY_BASE_URL": base,
-        "DINO_FALLBACK_BASE_URL": base,
-        "DINO_PUBLIC_BASE_URL": base,
+        "DINO_PRIMARY_BASE_URL": CANONICAL_BASE_URL,
+        "DINO_FALLBACK_BASE_URL": CANONICAL_BASE_URL,
+        "DINO_PUBLIC_BASE_URL": CANONICAL_BASE_URL,
         "REDIRECT_URI": auth_redirect_uri(),
         "DASHBOARD_REDIRECT_URI": dashboard_redirect_uri(),
-        "VERIFY_REDIRECT_URI": os.getenv("VERIFY_REDIRECT_URI", auth_redirect_uri()),
-        "TRIAL_REDIRECT_URI": os.getenv("TRIAL_REDIRECT_URI", trial_redirect_uri()),
+        "VERIFY_REDIRECT_URI": _clean_url(os.getenv("VERIFY_REDIRECT_URI", "")) or auth_redirect_uri(),
+        "TRIAL_REDIRECT_URI": _clean_url(os.getenv("TRIAL_REDIRECT_URI", "")) or trial_redirect_uri(),
     }
-    for key, value in values.items():
-        os.environ[key] = _clean_url(value) if key.endswith("URL") else value
+    os.environ.update(values)
 
 
 def validate() -> None:
-    """Fail fast on production configuration errors without exposing secrets."""
+    """Fail fast on unsafe or contradictory production configuration."""
     base = public_base_url()
-    if not base.startswith("https://"):
-        raise RuntimeError("DINO_PUBLIC_BASE_URL must use HTTPS")
-    if base == "https://dino-web-2trw.onrender.com":
-        raise RuntimeError("Production public URL must be https://dinobotservice.64bit.kr")
+    parsed = urlsplit(base)
+    if base != CANONICAL_BASE_URL:
+        raise RuntimeError(
+            "DINO_PUBLIC_BASE_URL must be exactly https://dinobotservice.64bit.kr in production"
+        )
+    if parsed.scheme != "https" or parsed.netloc != "dinobotservice.64bit.kr":
+        raise RuntimeError("Invalid canonical public URL")
 
     required = (
         "DISCORD_TOKEN",
@@ -64,3 +73,10 @@ def validate() -> None:
     missing = [name for name in required if not os.getenv(name, "").strip()]
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+
+    session_secret = os.getenv("SESSION_SECRET", "").strip()
+    if len(session_secret.encode("utf-8")) < 32:
+        raise RuntimeError("SESSION_SECRET must be at least 32 bytes")
+
+    if os.getenv("DASHBOARD_REDIRECT_URI", "") != dashboard_redirect_uri():
+        raise RuntimeError("DASHBOARD_REDIRECT_URI does not match the canonical OAuth callback")
