@@ -2,13 +2,16 @@
 """DinoBot production entrypoint."""
 import os
 
-PRIMARY_BASE_URL = "https://dinobotservice.64bit.kr"
+# Canonical public URL: Render service. Keep this identical to the Discord
+# Developer Portal OAuth redirect URI unless a custom domain is deliberately
+# configured there as well.
+PRIMARY_BASE_URL = "https://dino-web-2trw.onrender.com"
 FALLBACK_BASE_URL = "https://dino-web-2trw.onrender.com"
 PRODUCTION_BASE_URL = PRIMARY_BASE_URL
 os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-REDIRECT_URI = "https://dinobotservice.64bit.kr/dashboard/callback"
+REDIRECT_URI = f"{PRODUCTION_BASE_URL}/dashboard/callback"
 os.environ["REDIRECT_URI"] = REDIRECT_URI
 os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
 VERIFY_REDIRECT_URI = os.getenv("VERIFY_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback").strip().rstrip("/")
