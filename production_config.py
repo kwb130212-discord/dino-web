@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Centralized production configuration for DinoBot.
-
-The public custom domain is the single canonical origin. Render remains the
-runtime host, but is never used as the OAuth redirect origin.
-"""
+"""Centralized production configuration for DinoBot."""
 from __future__ import annotations
 
 import os
@@ -19,8 +15,6 @@ def _clean_url(value: str) -> str:
 
 
 def public_base_url() -> str:
-    # Allow an explicit override for controlled staging, but production defaults
-    # to the user's configured custom domain rather than Render's hostname.
     return _clean_url(os.getenv("DINO_PUBLIC_BASE_URL", CANONICAL_BASE_URL))
 
 
@@ -37,7 +31,7 @@ def trial_redirect_uri() -> str:
 
 
 def apply_environment() -> None:
-    """Publish one consistent set of URLs to legacy modules."""
+    """Publish one consistent set of URLs to legacy feature modules."""
     base = public_base_url()
     values = {
         "DINO_PRIMARY_BASE_URL": base,
@@ -60,7 +54,13 @@ def validate() -> None:
     if base == "https://dino-web-2trw.onrender.com":
         raise RuntimeError("Production public URL must be https://dinobotservice.64bit.kr")
 
-    required = ("DISCORD_TOKEN", "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DATABASE_URL")
+    required = (
+        "DISCORD_TOKEN",
+        "DISCORD_CLIENT_ID",
+        "DISCORD_CLIENT_SECRET",
+        "DATABASE_URL",
+        "SESSION_SECRET",
+    )
     missing = [name for name in required if not os.getenv(name, "").strip()]
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
