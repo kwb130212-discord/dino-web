@@ -18,9 +18,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 log = logging.getLogger("DinoBot.Auth")
 
-# Dashboard OAuth has one canonical callback.  Do not let a stale Render
-# environment variable switch this flow to the old *.onrender.com URL.
-CANONICAL_DASHBOARD_REDIRECT_URI = "https://dinobotservice.64bit.kr/dashboard/callback"
+# One canonical callback for the production Render service. The Discord
+# Developer Portal must contain this exact URI.
+CANONICAL_DASHBOARD_REDIRECT_URI = "https://dino-web-2trw.onrender.com/dashboard/callback"
 REDIRECT_URI = CANONICAL_DASHBOARD_REDIRECT_URI
 
 
@@ -59,7 +59,7 @@ def install(core) -> None:
     redirect_uri = CANONICAL_DASHBOARD_REDIRECT_URI
 
     # Keep the process-wide values canonical too. Other modules that still read
-    # REDIRECT_URI therefore cannot accidentally reintroduce the old callback.
+    # REDIRECT_URI therefore cannot accidentally reintroduce another callback.
     os.environ["REDIRECT_URI"] = redirect_uri
     os.environ["DASHBOARD_REDIRECT_URI"] = redirect_uri
 
