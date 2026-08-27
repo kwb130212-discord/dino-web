@@ -18,11 +18,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 log = logging.getLogger("DinoBot.Auth")
 
-# Dashboard Discord OAuth redirect URI is controlled exclusively by REDIRECT_URI.
-# It must exactly match the URI registered in the Discord Developer Portal.
-REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip().rstrip("/")
-if not REDIRECT_URI:
-    raise RuntimeError("REDIRECT_URI 환경변수가 설정되지 않았습니다.")
+# Dashboard OAuth has one canonical callback.  Do not let a stale Render
+# environment variable switch this flow to the old *.onrender.com URL.
+CANONICAL_DASHBOARD_REDIRECT_URI = "https://dinobotservice.64bit.kr/dashboard/callback"
+REDIRECT_URI = CANONICAL_DASHBOARD_REDIRECT_URI
 
 
 def _state_secret() -> bytes:
@@ -57,7 +56,12 @@ def install(core) -> None:
     app = core.app
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
-    redirect_uri = REDIRECT_URI
+    redirect_uri = CANONICAL_DASHBOARD_REDIRECT_URI
+
+    # Keep the process-wide values canonical too. Other modules that still read
+    # REDIRECT_URI therefore cannot accidentally reintroduce the old callback.
+    os.environ["REDIRECT_URI"] = redirect_uri
+    os.environ["DASHBOARD_REDIRECT_URI"] = redirect_uri
 
     def oauth_diag(request: Request, stage: str, **extra):
         try:
@@ -93,9 +97,6 @@ def install(core) -> None:
             log.error("OAuth state secret unavailable: %s", exc)
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 또는 DISCORD_CLIENT_SECRET을 설정해 주세요.</p></main></div>')
 
-        # State is intentionally self-contained and HMAC signed. Do not bind it
-        # to the Starlette session cookie: proxies/browsers can legitimately
-        # drop or rotate that cookie during an external Discord redirect.
         params = {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
@@ -114,13 +115,13 @@ def install(core) -> None:
         state = request.query_params.get("state", "")
         oauth_diag(request, "callback_received", code_present=bool(request.query_params.get("code")), state_present=bool(state), discord_error=request.query_params.get("error", ""))
         if request.query_params.get("error"):
-            return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">Discord 인증 거부</h1><p class="desc">Discord가 OAuth 요청을 거부했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
+            error = request.query_params.get("error", "")
+            description = request.query_params.get("error_description", "")
+            log.warning("[OAUTH-DIAG] Discord authorization denied error=%r description=%r", error, description[:300])
+            return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">Discord 인증 거부</h1><p class="desc">Discord가 OAuth 요청을 거부했습니다.<br>다시 로그인해 주세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
 
-        # Do not require a pre-existing session cookie here. The signed state
-        # itself is the CSRF correlation value and remains verifiable across
-        # the Discord redirect even when the session cookie is not returned.
         if not state or not _verify_state(state):
-            log.warning("[OAUTH-DIAG] stage='state_verification_failed' state_present=%s stateless_state_ok=%s", bool(state), bool(state and _verify_state(state)))
+            log.warning("[OAUTH-DIAG] stage='state_verification_failed' state_present=%s", bool(state))
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">OAuth State 오류</h1><p class="desc">인증 요청이 만료되었거나 유효하지 않습니다. 다시 로그인해 주세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
 
         code = request.query_params.get("code")
@@ -140,9 +141,16 @@ def install(core) -> None:
                     },
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
-                oauth_diag(request, "token_exchange_response", discord_status=token_resp.status_code)
+                token_json = token_resp.json() if token_resp.content else {}
+                oauth_diag(
+                    request,
+                    "token_exchange_response",
+                    discord_status=token_resp.status_code,
+                    discord_error=token_json.get("error", "") if isinstance(token_json, dict) else "",
+                    discord_error_description=str(token_json.get("error_description", ""))[:300] if isinstance(token_json, dict) else "",
+                )
                 token_resp.raise_for_status()
-                access_token = token_resp.json().get("access_token")
+                access_token = token_json.get("access_token") if isinstance(token_json, dict) else None
                 if not access_token:
                     raise RuntimeError("Discord response did not contain access_token")
                 headers = {"Authorization": f"Bearer {access_token}"}
@@ -152,6 +160,14 @@ def install(core) -> None:
                 guilds_resp = await client.get("https://discord.com/api/users/@me/guilds", headers=headers)
                 guilds_resp.raise_for_status()
                 discord_guilds = guilds_resp.json()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            try:
+                detail = exc.response.json()
+            except Exception:
+                detail = {}
+            log.error("Discord OAuth HTTP error status=%s detail=%s", status, str(detail)[:500])
+            return page('<div class="wrap"><main class="card"><h1 class="title">인증 실패</h1><p class="desc">Discord OAuth 처리에 실패했습니다.<br>잠시 후 다시 시도해 주세요.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
         except Exception as exc:
             oauth_diag(request, "token_exchange_failed", exception_type=type(exc).__name__, exception=str(exc)[:300])
             log.exception("Discord OAuth API 오류")
@@ -180,10 +196,15 @@ def install(core) -> None:
         request.session.clear()
         return RedirectResponse("/dashboard/login")
 
+    # Remove earlier copies so module installation order cannot create duplicate
+    # handlers for the same OAuth endpoints.
     for route in list(app.router.routes):
         if getattr(route, "path", "") in {"/dashboard/login", "/dashboard/callback", "/dashboard/logout"}:
             try:
                 app.router.routes.remove(route)
-                app.router.routes.insert(0, route)
             except ValueError:
                 pass
+    # Re-add the canonical handlers after cleanup.
+    app.get("/dashboard/login", response_class=HTMLResponse)(dashboard_login)
+    app.get("/dashboard/callback", response_class=HTMLResponse)(dashboard_callback)
+    app.get("/dashboard/logout")(dashboard_logout)
