@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Public web entry routes for DinoBot.
-
-Keeps the service root friendly while the existing health/status endpoint can
-remain machine-readable. OAuth itself lives in dashboard_auth.py.
-"""
+"""Public web entry routes for DinoBot."""
 import os
 from fastapi import Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-# Must match the OAuth callback origin configured in main.py and Discord.
 BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/")
 
 
@@ -42,6 +37,11 @@ def install(core) -> None:
 <div class="foot">Secure Discord OAuth · DinoBot</div></main></body></html>"""
         )
 
+    # Render's health checker can use HEAD /. Keep this endpoint side-effect free.
+    @app.head("/")
+    async def web_home_head():
+        return Response(status_code=200)
+
     @app.get("/login")
     async def login_alias(request: Request):
         return RedirectResponse("/dashboard/login")
@@ -50,8 +50,6 @@ def install(core) -> None:
     async def oauth_login_alias(request: Request):
         return RedirectResponse("/dashboard/login")
 
-    # core.py registers its legacy GET / before this module is installed.
-    # FastAPI matches the first route, so promote the public aliases explicitly.
     for route in list(app.router.routes):
         if getattr(route, "path", None) in {"/", "/login", "/oauth/login"}:
             _front(app, route)
