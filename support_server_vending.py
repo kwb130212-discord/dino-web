@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """DinoBot support-server vending machine.
 
-Secret prefix command:
-    !서포트서버자판기
+Secret prefix command: !서포트서버자판기
 
 The panel exposes exactly three primary buttons:
 - 링크생성: creates a tracked support-server invite for the user.
@@ -10,7 +9,7 @@ The panel exposes exactly three primary buttons:
 - 포인트구매: opens the configured point-purchase page.
 
 Invited members are attributed to the invite owner by comparing invite-use counts.
-Each Discord user can be credited only once, and bots/self-invites are ignored.
+Each Discord account can be credited only once; bots and self-invites are ignored.
 """
 from __future__ import annotations
 
@@ -20,9 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import discord
-from discord.ext import commands
 from discord.ui import Button, View
-
 
 DEFAULT_LICENSE_URL = "https://dinobotservice.64bit.kr/dashboard/licenses"
 
@@ -54,7 +51,7 @@ def _point_purchase_url() -> str:
     return value if value.startswith(("https://", "http://")) else _license_url()
 
 
-async def install(core) -> None:
+def install(core) -> None:
     bot = core.bot
     DB = core.DB
     logger = core.logger
@@ -74,9 +71,7 @@ async def install(core) -> None:
                         last_seen_at TEXT NOT NULL
                     )"""
                 )
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_support_invites_inviter ON support_invites(inviter_id)"
-                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_support_invites_inviter ON support_invites(inviter_id)")
                 cur.execute(
                     """CREATE TABLE IF NOT EXISTS support_referrals (
                         referred_user_id BIGINT PRIMARY KEY,
@@ -86,9 +81,7 @@ async def install(core) -> None:
                         joined_at TEXT NOT NULL
                     )"""
                 )
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_support_referrals_inviter ON support_referrals(inviter_id, joined_at)"
-                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_support_referrals_inviter ON support_referrals(inviter_id, joined_at)")
                 conn.commit()
 
     try:
@@ -98,9 +91,10 @@ async def install(core) -> None:
 
     invite_cache: dict[str, int] = {}
     refresh_lock = asyncio.Lock()
+    attribution_lock = asyncio.Lock()
 
     async def refresh_invites(guild: discord.Guild) -> None:
-        if support_id and guild.id != support_id:
+        if support_id is None or guild.id != support_id:
             return
         async with refresh_lock:
             try:
@@ -124,22 +118,23 @@ async def install(core) -> None:
                 )
 
     async def create_tracked_invite(guild: discord.Guild, creator: discord.Member) -> discord.Invite:
-        candidates = []
-        if isinstance(creator, discord.Member) and creator.guild_permissions.create_instant_invite:
-            if isinstance(creator.guild.system_channel, discord.TextChannel):
-                candidates.append(creator.guild.system_channel)
-        candidates.extend(
+        me = guild.me
+        if me is None or not me.guild_permissions.create_instant_invite:
+            raise RuntimeError("봇에게 초대 링크 생성 권한이 없습니다.")
+
+        candidates = [
             c for c in guild.text_channels
-            if c not in candidates and c.permissions_for(guild.me).create_instant_invite
-        )
+            if c.permissions_for(me).create_instant_invite
+        ]
         if not candidates:
             raise RuntimeError("봇이 초대 링크를 생성할 수 있는 채널이 없습니다.")
+
         channel = candidates[0]
         invite = await channel.create_invite(
             max_age=0,
             max_uses=0,
             unique=True,
-            reason="DinoBot support referral invite",
+            reason=f"DinoBot support referral invite by {creator.id}",
         )
         invite_cache[invite.code] = int(invite.uses or 0)
         await DB.execute(
@@ -173,7 +168,6 @@ async def install(core) -> None:
         inviter = invite.inviter
         if inviter is None or inviter.id == member.id or member.bot:
             return False
-        # The referred Discord account is globally unique in this table.
         inserted = await DB.execute(
             """INSERT INTO support_referrals(referred_user_id,inviter_id,invite_code,guild_id,joined_at)
                VALUES(%s,%s,%s,%s,%s) ON CONFLICT(referred_user_id) DO NOTHING""",
@@ -201,15 +195,14 @@ async def install(core) -> None:
     class SupportVendingView(View):
         def __init__(self):
             super().__init__(timeout=None)
-
             link = Button(label="링크생성", emoji="🔗", style=discord.ButtonStyle.primary, custom_id="dinobot:support:invite")
             use = Button(label="포인트사용", emoji="🎫", style=discord.ButtonStyle.success, custom_id="dinobot:support:use")
-            buy = Button(label="포인트구매", emoji="💳", style=discord.ButtonStyle.secondary, url=_point_purchase_url(), custom_id="dinobot:support:buy")
+            buy = Button(label="포인트구매", emoji="💳", style=discord.ButtonStyle.secondary, url=_point_purchase_url())
 
             async def link_callback(interaction: discord.Interaction):
                 await interaction.response.defer(ephemeral=True)
-                if support_id and interaction.guild_id != support_id:
-                    return await interaction.followup.send("❌ 이 버튼은 DinoBot 서포트 서버에서만 사용할 수 있습니다.", ephemeral=True)
+                if support_id is None or interaction.guild_id != support_id:
+                    return await interaction.followup.send("❌ 이 기능은 설정된 DinoBot 서포트 서버에서만 사용할 수 있습니다.", ephemeral=True)
                 guild = interaction.guild
                 if guild is None or not isinstance(interaction.user, discord.Member):
                     return await interaction.followup.send("❌ 서포트 서버에서만 사용할 수 있습니다.", ephemeral=True)
@@ -226,8 +219,8 @@ async def install(core) -> None:
 
             async def use_callback(interaction: discord.Interaction):
                 await interaction.response.defer(ephemeral=True)
-                if support_id and interaction.guild_id != support_id:
-                    return await interaction.followup.send("❌ 이 버튼은 DinoBot 서포트 서버에서만 사용할 수 있습니다.", ephemeral=True)
+                if support_id is None or interaction.guild_id != support_id:
+                    return await interaction.followup.send("❌ 이 기능은 설정된 DinoBot 서포트 서버에서만 사용할 수 있습니다.", ephemeral=True)
                 points = await balance(interaction.user.id)
                 invited = await referral_stats(interaction.user.id)
                 await interaction.followup.send(
@@ -243,25 +236,24 @@ async def install(core) -> None:
 
     @bot.listen("on_member_join")
     async def _support_member_join(member: discord.Member):
-        if support_id and member.guild.id != support_id:
+        if support_id is None or member.guild.id != support_id or member.bot:
             return
-        if member.bot:
-            return
-        try:
-            invites = await member.guild.invites()
-            used = None
-            for invite in invites:
-                current = int(invite.uses or 0)
-                previous = invite_cache.get(invite.code, current)
-                if current > previous:
-                    used = invite
-                    break
-            for invite in invites:
-                invite_cache[invite.code] = int(invite.uses or 0)
-            if used:
-                await credit_referral(member, used)
-        except (discord.Forbidden, discord.HTTPException):
-            logger.exception("Support referral attribution failed")
+        async with attribution_lock:
+            try:
+                invites = await member.guild.invites()
+                used = None
+                for invite in invites:
+                    current = int(invite.uses or 0)
+                    previous = invite_cache.get(invite.code, current)
+                    if current > previous:
+                        used = invite
+                        break
+                for invite in invites:
+                    invite_cache[invite.code] = int(invite.uses or 0)
+                if used:
+                    await credit_referral(member, used)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Support referral attribution failed")
 
     @bot.listen("on_ready")
     async def _support_ready():
@@ -269,19 +261,16 @@ async def install(core) -> None:
         if guild:
             await refresh_invites(guild)
 
-    # The prefix command is intentionally not advertised as a slash command.
     @bot.listen("on_message")
     async def _support_secret_command(message: discord.Message):
         if message.author.bot or message.content.strip() != "!서포트서버자판기":
             return
-        if support_id and message.guild and message.guild.id != support_id:
-            return
-        if support_id and message.guild is None:
+        if support_id is None or message.guild is None or message.guild.id != support_id:
             return
         embed = discord.Embed(
             title="🎰 DinoBot 서포트 서버 자판기",
             description=(
-                "서포트 서버에서 활동하면 초대 포인트를 적립할 수 있습니다.\n\n"
+                "서포트 서버 초대 실적을 포인트로 적립할 수 있습니다.\n\n"
                 "🔗 **링크생성** — 개인 초대 링크 생성 및 초대 실적 확인\n"
                 "🎫 **포인트사용** — 보유 포인트와 라이센스 자판기 확인\n"
                 "💳 **포인트구매** — 포인트 구매 페이지 이동\n\n"
@@ -291,14 +280,16 @@ async def install(core) -> None:
         )
         await message.channel.send(embed=embed, view=SupportVendingView())
 
-    # Store the view so the three buttons remain usable after restarts.
     try:
         bot.add_view(SupportVendingView())
     except Exception:
         logger.exception("Support vending persistent view registration failed")
 
-    logger.info(
-        "Support vending installed: support_guild=%s reward=%sP command=!서포트서버자판기",
-        support_id,
-        _invite_reward(),
-    )
+    if support_id is None:
+        logger.warning("SUPPORT_SERVER_ID is not configured; support vending is disabled")
+    else:
+        logger.info(
+            "Support vending installed: support_guild=%s reward=%sP command=!서포트서버자판기",
+            support_id,
+            _invite_reward(),
+        )
