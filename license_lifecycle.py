@@ -21,9 +21,16 @@ def install(core) -> None:
         return datetime.now(timezone.utc)
 
     def is_bot_operator(interaction: discord.Interaction) -> bool:
-        if interaction.guild and interaction.user.guild_permissions.administrator:
-            return True
-        return any(getattr(r, "name", "") == "! !디노" for r in getattr(interaction.user, "roles", []))
+        # Permission must be identity-based; a display name/role name alone is spoofable.
+        allowed_ids = {
+            int(x.strip()) for x in str(getattr(core, "BOT_OPERATOR_IDS", "") or "").split(",")
+            if x.strip().isdigit()
+        }
+        if allowed_ids:
+            return interaction.user.id in allowed_ids
+        # Safe bootstrap fallback: exact configured username/tag only when no IDs are configured.
+        configured_names = {"dino_.dino", "! !디노"}
+        return str(getattr(interaction.user, "name", "")).lower() in configured_names
 
     def init_schema():
         with DB.get_connection() as conn:
@@ -47,13 +54,13 @@ def install(core) -> None:
     except Exception:
         logger.exception("License lifecycle schema initialization failed")
 
-    @bot.tree.command(name="서버영구등록", description="봇 관리자(! !디노)가 서버를 영구 등록합니다.")
+    @bot.tree.command(name="서버영구등록", description="봇 관리자만 서버를 영구 등록합니다.")
     @app_commands.describe(등급="영구 등록할 라이센스 등급")
     async def permanent_register(interaction: discord.Interaction, 등급: str):
         if not interaction.guild:
             return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
         if not is_bot_operator(interaction):
-            return await interaction.response.send_message("❌ 봇 관리자(! !디노)만 사용할 수 있습니다.", ephemeral=True)
+            return await interaction.response.send_message("❌ 봇 관리자만 사용할 수 있습니다.", ephemeral=True)
         tier = ALIASES.get((등급 or "").strip().lower())
         if not tier:
             return await interaction.response.send_message("❌ 브론즈 / 실버 / 골드 / 플래티넘 중 하나를 입력하세요.", ephemeral=True)
@@ -76,7 +83,7 @@ def install(core) -> None:
         row = await DB.fetchone("SELECT tier,registered_by,registered_at FROM permanent_guilds WHERE guild_id=%s", interaction.guild.id)
         if not row:
             return await interaction.response.send_message("ℹ️ 이 서버는 영구 등록되어 있지 않습니다.", ephemeral=True)
-        tier = row.get("tier", "bronze")
+        tier = row.get("tier", "bronze") if hasattr(row, "get") else row[0]
         e = discord.Embed(title="♾️ 영구 등록 정보", color=discord.Color.blurple())
         e.add_field(name="등급", value=TIERS.get(tier, tier), inline=True)
         e.add_field(name="기간", value="영구", inline=True)
@@ -96,7 +103,8 @@ def install(core) -> None:
         now_ = now()
         for row in rows or []:
             try:
-                used = datetime.fromisoformat(str(row["used_at"]).replace("Z", "+00:00"))
+                used_at = row.get("used_at") if hasattr(row, "get") else row["used_at"]
+                used = datetime.fromisoformat(str(used_at).replace("Z", "+00:00"))
                 if used.tzinfo is None:
                     used = used.replace(tzinfo=timezone.utc)
                 expiry = used + timedelta(days=int(row["duration_days"]))
@@ -107,7 +115,8 @@ def install(core) -> None:
                     marker = await DB.fetchone("SELECT 1 FROM license_expiry_notifications WHERE license_key=%s AND remaining_days=%s", key, days_left)
                     if marker:
                         continue
-                    user = bot.get_user(int(row["issuer_id"])) or await bot.fetch_user(int(row["issuer_id"]))
+                    issuer_id = int(row["issuer_id"])
+                    user = bot.get_user(issuer_id) or await bot.fetch_user(issuer_id)
                     embed = discord.Embed(title="⏰ 라이센스 만료 예정", description=f"발급하신 라이센스가 **{days_left}일 후** 만료됩니다.", color=discord.Color.orange())
                     embed.add_field(name="등급", value=TIERS.get(str(row["tier"]), str(row["tier"])), inline=True)
                     embed.add_field(name="남은 기간", value=f"약 {days_left}일", inline=True)
@@ -116,7 +125,7 @@ def install(core) -> None:
                     try:
                         await user.send(embed=embed)
                     except (discord.Forbidden, discord.HTTPException):
-                        logger.warning("Could not DM license issuer %s for %s-day expiry notice", row["issuer_id"], days_left)
+                        logger.warning("Could not DM license issuer %s for %s-day expiry notice", issuer_id, days_left)
                     await DB.execute("INSERT INTO license_expiry_notifications(license_key,remaining_days,notified_at) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", key, days_left, now_.isoformat())
             except Exception:
                 logger.exception("License expiry scan failed for a license")
@@ -129,9 +138,6 @@ def install(core) -> None:
     async def before_expiry_loop():
         await bot.wait_until_ready()
 
-    # main.py imports modules before discord.py has a running event loop.
-    # Starting a tasks.Loop during import raises RuntimeError on Render.
-    # Start it only after the bot has emitted on_ready.
     @bot.listen("on_ready")
     async def _license_lifecycle_ready():
         if not expiry_loop.is_running():
