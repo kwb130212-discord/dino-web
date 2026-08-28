@@ -18,11 +18,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 log = logging.getLogger("DinoBot.Auth")
 
-# Single source of truth for the production Dashboard OAuth callback.
-# This MUST exactly match a Redirect URI registered in Discord Developer Portal.
-# The default is the current DinoBot Render service; a registered custom domain
-# can be supplied explicitly with DISCORD_REDIRECT_URI.
-DEFAULT_PUBLIC_BASE_URL = "https://dino-web-2trw.onrender.com"
+# Canonical production OAuth callback. This must exactly match Discord Developer Portal.
+DEFAULT_PUBLIC_BASE_URL = "https://dinobotservice.64bit.kr"
 PUBLIC_BASE_URL = (os.getenv("DINO_PUBLIC_BASE_URL") or DEFAULT_PUBLIC_BASE_URL).strip().rstrip("/")
 CANONICAL_DASHBOARD_REDIRECT_URI = (os.getenv("DISCORD_REDIRECT_URI") or f"{PUBLIC_BASE_URL}/dashboard/callback").strip().rstrip("/")
 REDIRECT_URI = CANONICAL_DASHBOARD_REDIRECT_URI
@@ -60,12 +57,8 @@ def install(core) -> None:
     app = core.app
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
-    # Never construct the OAuth URI from the incoming request host. Discord
-    # compares redirect_uri byte-for-byte with the registered application URI.
     redirect_uri = REDIRECT_URI
 
-    # Process-wide compatibility for older modules. Never derive OAuth redirect
-    # URIs from Host headers or Render's internal service hostname.
     os.environ["DINO_PUBLIC_BASE_URL"] = PUBLIC_BASE_URL
     os.environ["REDIRECT_URI"] = redirect_uri
     os.environ["DASHBOARD_REDIRECT_URI"] = redirect_uri
@@ -104,7 +97,6 @@ def install(core) -> None:
         except RuntimeError as exc:
             log.error("OAuth state secret unavailable: %s", exc)
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 또는 DISCORD_CLIENT_SECRET을 설정해 주세요.</p></main></div>')
-
         params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": "identify guilds", "state": state, "prompt": "consent"}
         auth_url = "https://discord.com/oauth2/authorize?" + urlencode(params)
         oauth_diag(request, "authorize_url_created", authorize_redirect_uri=redirect_uri, oauth_scope="identify guilds")
@@ -138,7 +130,6 @@ def install(core) -> None:
             oauth_diag(request, "token_exchange_failed", exception_type=type(exc).__name__, exception=str(exc)[:300])
             log.exception("Discord OAuth API error")
             return page('<div class="wrap"><main class="card"><h1 class="title">인증 실패</h1><p class="desc">Discord 인증 처리 중 오류가 발생했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
-
         uid = int(me["id"]); name = me.get("global_name") or me.get("username") or "Discord 사용자"
         owned = [{"id": str(g.get("id")), "name": str(g.get("name") or "이름 없는 서버"), "icon": g.get("icon")} for g in (discord_guilds if isinstance(discord_guilds, list) else []) if g.get("owner") is True]
         admin = await core.is_dashboard_admin(uid)
