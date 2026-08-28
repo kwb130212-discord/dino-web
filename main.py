@@ -19,6 +19,9 @@ os.environ["TRIAL_REDIRECT_URI"] = os.getenv("TRIAL_REDIRECT_URI", f"{PRODUCTION
 
 import uvicorn
 import core
+# Single canonical tier vocabulary shared by dashboard, Discord commands and DB.
+core.TIER_LABEL = {"bronze": "브론즈", "silver": "실버", "gold": "골드", "platinum": "플래티넘"}
+core.TIER_ORDER = {"bronze": 1, "silver": 2, "gold": 3, "platinum": 4}
 from startup_fixes import install as install_startup_fixes
 from security_hardening import install as install_security_hardening
 from web_entry import install as install_web_entry
