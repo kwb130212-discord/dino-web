@@ -45,6 +45,16 @@ def install(core) -> None:
     bot = core.bot
     DB = core.DB
 
+    # A legacy/core command may already exist. Remove only the exact names that
+    # this subsystem owns, then register one canonical implementation below.
+    # This makes installation idempotent across startup/retry paths and avoids
+    # CommandAlreadyRegistered without touching unrelated commands.
+    for _name in ("라이센스생성", "라이센스등급", "라이센스자판기", "라이센스정보"):
+        try:
+            bot.tree.remove_command(_name, type=discord.AppCommandType.chat_input)
+        except Exception:
+            pass
+
     # Idempotent schema. Existing data is never removed.
     def init_schema():
         with DB.get_connection() as conn:
