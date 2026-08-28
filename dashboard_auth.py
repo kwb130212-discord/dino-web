@@ -19,7 +19,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 log = logging.getLogger("DinoBot.Auth")
 DEFAULT_PUBLIC_BASE_URL = "https://dinobotservice.64bit.kr"
 PUBLIC_BASE_URL = (os.getenv("DINO_PUBLIC_BASE_URL") or DEFAULT_PUBLIC_BASE_URL).strip().rstrip("/")
-CANONICAL_DASHBOARD_REDIRECT_URI = (os.getenv("DISCORD_REDIRECT_URI") or f"{PUBLIC_BASE_URL}/dashboard/callback").strip().rstrip("/")
+# One canonical OAuth2 callback. Do not let an old REDIRECT_URI environment value
+# silently create a mismatch between Discord's authorize URL and token exchange.
+CANONICAL_DASHBOARD_REDIRECT_URI = f"{PUBLIC_BASE_URL}/dashboard/callback"
 REDIRECT_URI = CANONICAL_DASHBOARD_REDIRECT_URI
 
 
@@ -28,7 +30,12 @@ def _state_secret() -> bytes:
 
 
 def _make_state(purpose: str = "dashboard", guild_id: int | None = None) -> str:
-    payload = {"v": 4, "purpose": purpose, "iat": int(time.time()), "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")}
+    payload = {
+        "v": 5,
+        "purpose": purpose,
+        "iat": int(time.time()),
+        "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("="),
+    }
     if guild_id:
         payload["guild_id"] = str(guild_id)
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
@@ -48,7 +55,7 @@ def _decode_state(state: str, max_age: int = 600) -> dict | None:
             return None
         payload = json.loads(raw.decode())
         age = int(time.time()) - int(payload["iat"])
-        if payload.get("v") not in (3, 4) or age < 0 or age > max_age or not payload.get("nonce"):
+        if payload.get("v") not in (3, 4, 5) or age < 0 or age > max_age or not payload.get("nonce"):
             return None
         purpose = payload.get("purpose", "dashboard")
         if purpose not in {"dashboard", "verification"}:
@@ -75,7 +82,16 @@ def install(core) -> None:
 
     def oauth_diag(request: Request, stage: str, **extra):
         try:
-            checks = {"stage": stage, "configured_redirect_uri": redirect_uri, "request_host": request.headers.get("host", ""), "request_scheme": request.url.scheme, "forwarded_proto": request.headers.get("x-forwarded-proto", request.url.scheme), "callback_path": str(request.url.path), "client_id_present": bool(client_id), "client_secret_present": bool(client_secret)}
+            checks = {
+                "stage": stage,
+                "configured_redirect_uri": redirect_uri,
+                "request_host": request.headers.get("host", ""),
+                "request_scheme": request.url.scheme,
+                "forwarded_proto": request.headers.get("x-forwarded-proto", request.url.scheme),
+                "callback_path": str(request.url.path),
+                "client_id_present": bool(client_id),
+                "client_secret_present": bool(client_secret),
+            }
             checks.update(extra)
             log.warning("[OAUTH-DIAG] %s", " ".join(f"{k}={v!r}" for k, v in checks.items()))
         except Exception:
@@ -96,7 +112,14 @@ def install(core) -> None:
             state = _make_state("dashboard")
         except RuntimeError:
             return page('<div class="wrap"><main class="card"><h1 class="title">OAuth 설정 오류</h1><p class="desc">SESSION_SECRET 또는 DISCORD_CLIENT_SECRET을 설정해 주세요.</p></main></div>')
-        params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": "identify guilds", "state": state, "prompt": "consent"}
+        params = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "identify guilds",
+            "state": state,
+            "prompt": "consent",
+        }
         auth_url = "https://discord.com/oauth2/authorize?" + urlencode(params)
         oauth_diag(request, "authorize_url_created", authorize_redirect_uri=redirect_uri, oauth_scope="identify guilds")
         body = '<div class="wrap"><main class="card"><div class="brand">DinoBot Control Center</div><h1 class="title">대시보드 로그인</h1><p class="desc">Discord 계정으로 로그인한 뒤<br>내가 소유한 서버를 확인하고 DinoBot을 등록할 수 있습니다.</p><a class="btn" href="' + html.escape(auth_url, quote=True) + '">Discord로 계속하기</a><div class="small">서버 목록 권한이 필요합니다.</div></main></div>'
@@ -108,7 +131,15 @@ def install(core) -> None:
         payload = _decode_state(state)
         purpose = payload.get("purpose") if payload else None
         guild_id = int(payload["guild_id"]) if payload and payload.get("guild_id") and str(payload["guild_id"]).isdigit() else None
-        oauth_diag(request, "callback_received", code_present=bool(request.query_params.get("code")), state_present=bool(state), state_purpose=purpose or "", verification_guild_id=guild_id or 0, discord_error=request.query_params.get("error", ""))
+        oauth_diag(
+            request,
+            "callback_received",
+            code_present=bool(request.query_params.get("code")),
+            state_present=bool(state),
+            state_purpose=purpose or "",
+            verification_guild_id=guild_id or 0,
+            discord_error=request.query_params.get("error", ""),
+        )
         if request.query_params.get("error"):
             return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">Discord 인증 거부</h1><p class="desc">Discord가 OAuth 요청을 거부했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
         if not payload:
@@ -119,30 +150,76 @@ def install(core) -> None:
         try:
             timeout = httpx.Timeout(15.0, connect=5.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                token_resp = await client.post("https://discord.com/api/oauth2/token", data={"client_id": client_id, "client_secret": client_secret, "grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri}, headers={"Content-Type": "application/x-www-form-urlencoded"})
+                token_resp = await client.post(
+                    "https://discord.com/api/oauth2/token",
+                    data={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
                 token_json = token_resp.json() if token_resp.content else {}
-                oauth_diag(request, "token_exchange_response", discord_status=token_resp.status_code, discord_error=token_json.get("error", "") if isinstance(token_json, dict) else "")
+                oauth_diag(
+                    request,
+                    "token_exchange_response",
+                    discord_status=token_resp.status_code,
+                    discord_error=token_json.get("error", "") if isinstance(token_json, dict) else "",
+                )
                 token_resp.raise_for_status()
                 access_token = token_json.get("access_token")
                 refresh_token = token_json.get("refresh_token")
-                if not access_token: raise RuntimeError("Discord response did not contain access_token")
+                if not access_token:
+                    raise RuntimeError("Discord response did not contain access_token")
                 headers = {"Authorization": f"Bearer {access_token}"}
-                me_resp = await client.get("https://discord.com/api/users/@me", headers=headers); me_resp.raise_for_status(); me = me_resp.json()
-                guilds_resp = await client.get("https://discord.com/api/users/@me/guilds", headers=headers); guilds_resp.raise_for_status(); discord_guilds = guilds_resp.json()
+                me_resp = await client.get("https://discord.com/api/users/@me", headers=headers)
+                me_resp.raise_for_status()
+                me = me_resp.json()
+                guilds_resp = await client.get("https://discord.com/api/users/@me/guilds", headers=headers)
+                guilds_resp.raise_for_status()
+                discord_guilds = guilds_resp.json()
         except Exception as exc:
             oauth_diag(request, "token_exchange_failed", exception_type=type(exc).__name__, exception=str(exc)[:300])
             log.exception("Discord OAuth API error")
             return page('<div class="wrap"><main class="card"><h1 class="title">인증 실패</h1><p class="desc">Discord 인증 처리 중 오류가 발생했습니다.</p><a class="btn" href="/dashboard/login">다시 로그인</a></main></div>')
 
-        uid = int(me["id"]); name = me.get("global_name") or me.get("username") or "Discord 사용자"
-        owned = [{"id": str(g.get("id")), "name": str(g.get("name") or "이름 없는 서버"), "icon": g.get("icon")} for g in (discord_guilds if isinstance(discord_guilds, list) else []) if g.get("owner") is True]
+        uid = int(me["id"])
+        name = me.get("global_name") or me.get("username") or "Discord 사용자"
+        owned = [
+            {"id": str(g.get("id")), "name": str(g.get("name") or "이름 없는 서버"), "icon": g.get("icon")}
+            for g in (discord_guilds if isinstance(discord_guilds, list) else [])
+            if g.get("owner") is True
+        ]
         admin = await core.is_dashboard_admin(uid)
-        request.session.clear(); request.session["user_id"] = uid; request.session["user_name"] = name; request.session["is_admin"] = bool(admin)
-        avatar = me.get("avatar"); request.session["avatar_url"] = f"https://cdn.discordapp.com/avatars/{uid}/{avatar}.png?size=128" if avatar else "https://cdn.discordapp.com/embed/avatars/0.png"; request.session["owned_guilds"] = owned
+        request.session.clear()
+        request.session["user_id"] = uid
+        request.session["user_name"] = name
+        request.session["is_admin"] = bool(admin)
+        avatar = me.get("avatar")
+        request.session["avatar_url"] = f"https://cdn.discordapp.com/avatars/{uid}/{avatar}.png?size=128" if avatar else "https://cdn.discordapp.com/embed/avatars/0.png"
+        request.session["owned_guilds"] = owned
 
         if purpose == "verification" and guild_id:
+            # Refuse a verification state for a guild that the OAuth user cannot
+            # actually access. This avoids granting a role based only on a forged
+            # or cross-server callback.
+            guild_ids = {str(g.get("id")) for g in (discord_guilds if isinstance(discord_guilds, list) else [])}
+            if str(guild_id) not in guild_ids:
+                return page('<div class="wrap"><main class="card"><div class="brand">DinoBot</div><h1 class="title">서버 확인 실패</h1><p class="desc">인증을 시작한 Discord 서버의 멤버인지 확인할 수 없습니다.<br>해당 서버에 먼저 들어간 뒤 다시 인증해 주세요.</p><a class="btn" href="https://discord.com/app">Discord로 돌아가기</a></main></div>', "DinoBot · 서버 확인")
             try:
-                await core.DB.execute("""INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token) VALUES (%s,%s,%s,%s) ON CONFLICT (guild_id,user_id) DO UPDATE SET access_token=EXCLUDED.access_token, refresh_token=EXCLUDED.refresh_token""", guild_id, uid, access_token, refresh_token)
+                await core.DB.execute(
+                    """INSERT INTO user_tokens (guild_id, user_id, access_token, refresh_token)
+                       VALUES (%s,%s,%s,%s)
+                       ON CONFLICT (guild_id,user_id) DO UPDATE SET
+                         access_token=EXCLUDED.access_token,
+                         refresh_token=EXCLUDED.refresh_token""",
+                    guild_id,
+                    uid,
+                    access_token,
+                    refresh_token,
+                )
                 role_fn = getattr(core, "assign_verify_role", None)
                 role_ok, role_message = await role_fn(guild_id, uid) if role_fn else (False, "인증 역할 처리기를 찾을 수 없습니다.")
             except Exception:
@@ -151,7 +228,6 @@ def install(core) -> None:
             status = "인증 완료" if role_ok else "인증 완료 · 역할 확인 필요"
             msg = html.escape(role_message or "Discord 인증이 정상적으로 완료되었습니다.")
             dashboard = "/dashboard"
-            # The return button intentionally goes to Discord's application surface, not an arbitrary user-supplied URL.
             discord_return = "https://discord.com/app"
             body = f'<a class="toplink" href="{dashboard}">DinoBot 사용해보기</a><div class="wrap"><main class="card"><div class="ok">✓</div><div class="brand">DinoBot</div><h1 class="title">{status}</h1><p class="desc">{html.escape(str(name))}님의 Discord 인증이 처리되었습니다.<br>{msg}</p><a class="btn return" href="{discord_return}">원래 창으로 돌아가기</a></main></div>'
             return page(body, "DinoBot · 인증 완료")
@@ -160,12 +236,16 @@ def install(core) -> None:
 
     @app.get("/dashboard/logout")
     async def dashboard_logout(request: Request):
-        request.session.clear(); return RedirectResponse("/dashboard/login")
+        request.session.clear()
+        return RedirectResponse("/dashboard/login")
 
+    # Remove earlier registrations if another module installed the same routes.
     for route in list(app.router.routes):
         if getattr(route, "path", "") in {"/dashboard/login", "/dashboard/callback", "/dashboard/logout"}:
-            try: app.router.routes.remove(route)
-            except ValueError: pass
+            try:
+                app.router.routes.remove(route)
+            except ValueError:
+                pass
     app.get("/dashboard/login", response_class=HTMLResponse)(dashboard_login)
     app.get("/dashboard/callback", response_class=HTMLResponse)(dashboard_callback)
     app.get("/dashboard/logout")(dashboard_logout)
