@@ -2,7 +2,6 @@
 """DinoBot production entrypoint and canonical public URL configuration."""
 import os
 
-# Canonical production origin. Discord OAuth2 redirect URIs use this exact domain.
 PRIMARY_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").strip().rstrip("/")
 FALLBACK_BASE_URL = PRIMARY_BASE_URL
 PRODUCTION_BASE_URL = PRIMARY_BASE_URL
@@ -19,38 +18,21 @@ os.environ["TRIAL_REDIRECT_URI"] = os.getenv("TRIAL_REDIRECT_URI", f"{PRODUCTION
 
 import uvicorn
 import core
-# Single canonical tier vocabulary shared by dashboard, Discord commands and DB.
 core.TIER_LABEL = {"bronze": "브론즈", "silver": "실버", "gold": "골드", "platinum": "플래티넘"}
 core.TIER_ORDER = {"bronze": 1, "silver": 2, "gold": 3, "platinum": 4}
 
-# -----------------------------------------------------------------------------
-# Global command-registration guard
-# -----------------------------------------------------------------------------
-# Multiple feature installers are loaded during one process. Discord.py raises
-# CommandAlreadyRegistered when two installers expose the same slash command or
-# when an installer is invoked again during a startup/retry path. Replace an
-# existing command atomically instead of crashing the entire Render service.
-# This affects only same-name/same-type collisions; unrelated commands are kept.
 _bot_tree = core.bot.tree
 _original_add_command = _bot_tree.add_command
-
 
 def _safe_add_command(command, *args, **kwargs):
     try:
         existing = _bot_tree.get_command(command.name, type=command.type)
         if existing is not None:
             _bot_tree.remove_command(command.name, type=command.type)
-            core.logger.warning(
-                "Duplicate slash command replaced safely: /%s (%s)",
-                command.name,
-                getattr(command.type, "name", command.type),
-            )
+            core.logger.warning("Duplicate slash command replaced safely: /%s", command.name)
     except Exception:
-        # If inspection itself fails, let discord.py report the original error
-        # rather than hiding an unrelated programming error.
         pass
     return _original_add_command(command, *args, **kwargs)
-
 
 _bot_tree.add_command = _safe_add_command
 
@@ -73,6 +55,7 @@ from verification_features import install as install_verification_features
 from unified_control import install as install_unified_control
 from license_manager import install as install_license_manager
 from license_lifecycle import install as install_license_lifecycle
+from discord_dashboard_controls import install as install_discord_dashboard_controls
 
 install_startup_fixes(core)
 install_security_hardening(core)
@@ -93,6 +76,7 @@ install_verification_features(core)
 install_unified_control(core)
 install_license_manager(core)
 install_license_lifecycle(core)
+install_discord_dashboard_controls(core)
 
 app = core.app
 bot = core.bot
