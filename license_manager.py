@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""DinoBot license/vending subsystem.
+"""DinoBot license vending subsystem.
 
-Plans are intentionally explicit and stable:
-BRONZE -> SILVER -> GOLD -> PLATINUM.
-The first vending request by a Discord account is free for 30 days.
-All later issuance is controlled by authorized sellers/admins.
+Issuance is intentionally centralized in the vending panel:
+- One free Bronze 30-day trial per Discord account.
+- Paid vending: Bronze 100P / Silver 300P / Gold 500P / Platinum 1000P.
+- Configured bot operators have unlimited vending and are not charged points.
+- Direct license-generation commands are deliberately not exposed.
 """
 from __future__ import annotations
 
+import os
 import secrets
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
@@ -18,12 +20,15 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 PLANS = {
-    "bronze": {"name": "브론즈", "days": 30, "weight": 1},
-    "silver": {"name": "실버", "days": 30, "weight": 2},
-    "gold": {"name": "골드", "days": 30, "weight": 3},
-    "platinum": {"name": "플래티넘", "days": 30, "weight": 4},
+    "bronze": {"name": "브론즈", "days": 30, "price": 100, "weight": 1},
+    "silver": {"name": "실버", "days": 30, "price": 300, "weight": 2},
+    "gold": {"name": "골드", "days": 30, "price": 500, "weight": 3},
+    "platinum": {"name": "플래티넘", "days": 30, "price": 1000, "weight": 4},
 }
-ALIASES = {"브론즈":"bronze", "실버":"silver", "골드":"gold", "플래티넘":"platinum", "bronze":"bronze", "silver":"silver", "gold":"gold", "platinum":"platinum"}
+ALIASES = {
+    "브론즈": "bronze", "실버": "silver", "골드": "gold", "플래티넘": "platinum",
+    "bronze": "bronze", "silver": "silver", "gold": "gold", "platinum": "platinum",
+}
 
 
 def _now() -> datetime:
@@ -31,7 +36,6 @@ def _now() -> datetime:
 
 
 def _key() -> str:
-    # 192 bits of randomness, formatted for human entry.
     raw = secrets.token_hex(24).upper()
     return "DINO-" + "-".join(raw[i:i + 8] for i in range(0, len(raw), 8))
 
@@ -44,18 +48,24 @@ def install(core) -> None:
     app = core.app
     bot = core.bot
     DB = core.DB
+    logger = core.logger
 
-    # A legacy/core command may already exist. Remove only the exact names that
-    # this subsystem owns, then register one canonical implementation below.
-    # This makes installation idempotent across startup/retry paths and avoids
-    # CommandAlreadyRegistered without touching unrelated commands.
-    for _name in ("라이센스생성", "라이센스등급", "라이센스자판기", "라이센스정보"):
+    # The only public issuance surface is /라이센스자판기 and its buttons.
+    # Remove legacy issuance commands so they cannot bypass pricing/free-trial rules.
+    for _name in ("라이센스생성", "라이센스자판기"):
         try:
             bot.tree.remove_command(_name, type=discord.AppCommandType.chat_input)
         except Exception:
             pass
 
-    # Idempotent schema. Existing data is never removed.
+    def operator_ids() -> set[int]:
+        raw = os.getenv("BOT_OPERATOR_IDS") or getattr(core, "BOT_OPERATOR_IDS", "") or ""
+        return {int(x.strip()) for x in str(raw).split(",") if x.strip().isdigit()}
+
+    def is_unlimited(user_id: int) -> bool:
+        ids = operator_ids()
+        return bool(ids and user_id in ids)
+
     def init_schema():
         with DB.get_connection() as conn:
             with conn.cursor() as cur:
@@ -79,20 +89,25 @@ def install(core) -> None:
                 )""")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_license_events_issuer ON license_events (issuer_id, created_at)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_license_events_guild ON license_events (target_guild_id, created_at)")
+                cur.execute("""CREATE TABLE IF NOT EXISTS point_ledger (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    amount BIGINT NOT NULL,
+                    balance_after BIGINT,
+                    transaction_type TEXT NOT NULL,
+                    reference_id TEXT,
+                    guild_id BIGINT,
+                    created_at TEXT NOT NULL
+                )""")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_point_ledger_user ON point_ledger (user_id, created_at)")
                 conn.commit()
+
     try:
         init_schema()
     except Exception:
-        core.logger.exception("License subsystem schema initialization failed")
+        logger.exception("License subsystem schema initialization failed")
 
-    async def is_operator(interaction: discord.Interaction) -> bool:
-        if not interaction.guild:
-            return bool(await core.is_dashboard_admin(interaction.user.id))
-        if interaction.user.guild_permissions.administrator:
-            return True
-        return bool(await core.is_dashboard_admin(interaction.user.id))
-
-    async def create_license(issuer_id: int, tier: str, days: int, guild_id: Optional[int], user_id: Optional[int], event_type: str = "issued") -> str:
+    async def create_license(issuer_id: int, tier: str, days: int, guild_id: Optional[int], user_id: Optional[int], event_type: str = "vending") -> str:
         key = _key()
         await DB.execute(
             "INSERT INTO licenses (license_key,duration_days,is_used,used_by_guild,used_at,tier) VALUES (%s,%s,0,NULL,NULL,%s)",
@@ -105,6 +120,7 @@ def install(core) -> None:
         return key
 
     async def first_free(user_id: int, guild_id: Optional[int]) -> Optional[str]:
+        # Operators are unlimited, but their free/paid flow remains available too.
         row = await DB.fetchone("SELECT first_free_used, first_free_key FROM license_accounts WHERE user_id=%s", user_id)
         if row and int(row.get("first_free_used") or 0):
             return None
@@ -116,39 +132,109 @@ def install(core) -> None:
         )
         return key
 
-    @bot.tree.command(name="라이센스생성", description="브론즈/실버/골드/플래티넘 라이센스를 생성합니다.")
-    @app_commands.describe(등급="브론즈, 실버, 골드, 플래티넘", 기간="기간(일), 기본 30일")
-    async def license_create(interaction: discord.Interaction, 등급: str, 기간: int = 30):
-        if not await is_operator(interaction):
-            return await interaction.response.send_message("❌ 라이센스 생성 권한이 없습니다.", ephemeral=True)
-        tier = _plan(등급)
-        if not tier:
-            return await interaction.response.send_message("❌ 등급: 브론즈 / 실버 / 골드 / 플래티넘 중 하나를 입력하세요.", ephemeral=True)
-        days = max(1, min(int(기간), 3650))
-        key = await create_license(interaction.user.id, tier, days, interaction.guild_id, None)
-        e = discord.Embed(title="🎫 라이센스 생성 완료", description=f"`{key}`", color=discord.Color.blurple())
-        e.add_field(name="등급", value=PLANS[tier]["name"], inline=True)
-        e.add_field(name="기간", value=f"{days}일", inline=True)
-        e.set_footer(text="DinoBot License Center")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+    async def get_balance(user_id: int) -> int:
+        row = await DB.fetchone("SELECT COALESCE(SUM(amount),0) AS balance FROM point_ledger WHERE user_id=%s", user_id)
+        return int((row or {}).get("balance") or 0)
 
-    @bot.tree.command(name="라이센스등급", description="라이센스 등급별 기준을 확인합니다.")
-    async def license_tiers(interaction: discord.Interaction):
-        e = discord.Embed(title="💎 DinoBot 라이센스", description="모든 등급은 30일을 기본 단위로 관리합니다.", color=discord.Color.blurple())
-        for k, p in PLANS.items():
-            e.add_field(name=p["name"], value=f"기본 기간: {p['days']}일\n등급 코드: `{k}`", inline=True)
-        e.add_field(name="🎁 최초 1회 무료", value="Discord 계정당 1회 · 브론즈 · 30일", inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+    async def charge_points(user_id: int, amount: int, guild_id: Optional[int], reference_id: str) -> tuple[bool, int]:
+        if is_unlimited(user_id):
+            return True, await get_balance(user_id)
+        # Serialize balance check + debit in a transaction to prevent double-spend races.
+        try:
+            with DB.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COALESCE(SUM(amount),0) FROM point_ledger WHERE user_id=%s FOR UPDATE", (user_id,))
+                    balance = int(cur.fetchone()[0] or 0)
+                    if balance < amount:
+                        return False, balance
+                    new_balance = balance - amount
+                    cur.execute(
+                        "INSERT INTO point_ledger(user_id,amount,balance_after,transaction_type,reference_id,guild_id,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                        (user_id, -amount, new_balance, "LICENSE_PURCHASE", reference_id, guild_id, _now().isoformat()),
+                    )
+                    conn.commit()
+                    return True, new_balance
+        except Exception:
+            logger.exception("Point charge failed for user %s", user_id)
+            return False, await get_balance(user_id)
 
-    @bot.tree.command(name="라이센스자판기", description="계정 최초 1회 무료 30일 라이센스를 발급합니다.")
+    async def deliver(interaction: discord.Interaction, tier: str, free: bool = False):
+        plan = PLANS[tier]
+        if free:
+            key = await first_free(interaction.user.id, interaction.guild_id)
+            if not key:
+                return await interaction.response.send_message("⚠️ 이 계정은 무료 30일 체험을 이미 사용했습니다.", ephemeral=True)
+            price_text = "무료"
+            balance_text = "무료 체험"
+        else:
+            reference = f"license:{interaction.user.id}:{secrets.token_hex(8)}"
+            ok, balance = await charge_points(interaction.user.id, plan["price"], interaction.guild_id, reference)
+            if not ok:
+                return await interaction.response.send_message(
+                    f"❌ 포인트가 부족합니다.\n필요: **{plan['price']:,}P** · 보유: **{balance:,}P**",
+                    ephemeral=True,
+                )
+            key = await create_license(interaction.user.id, tier, plan["days"], interaction.guild_id, interaction.user.id, "vending_unlimited" if is_unlimited(interaction.user.id) else "vending_purchase")
+            price_text = "무제한 관리자" if is_unlimited(interaction.user.id) else f"{plan['price']:,}P"
+            balance_text = "무제한" if is_unlimited(interaction.user.id) else f"{balance:,}P"
+
+        e = discord.Embed(title="🎫 라이센스 발급 완료", description=f"발급 키\n`{key}`", color=discord.Color.blurple())
+        e.add_field(name="등급", value=plan["name"], inline=True)
+        e.add_field(name="기간", value=f"{plan['days']}일", inline=True)
+        e.add_field(name="결제", value=price_text, inline=True)
+        e.add_field(name="잔액", value=balance_text, inline=True)
+        e.set_footer(text="DinoBot License Vending Machine")
+        try:
+            await interaction.user.send(embed=e)
+            await interaction.response.send_message("✅ 라이센스를 DM으로 전달했습니다.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(embed=e, ephemeral=True)
+
+    class FreeTrialButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="무료체험 1달", emoji="🎁", style=discord.ButtonStyle.success, custom_id="dinobot:license:free")
+        async def callback(self, interaction: discord.Interaction):
+            await deliver(interaction, "bronze", free=True)
+
+    class PurchaseSelect(discord.ui.Select):
+        def __init__(self):
+            options = [discord.SelectOption(label=p["name"], value=k, description=f"30일 · {p['price']:,}P") for k, p in PLANS.items()]
+            super().__init__(placeholder="구매할 라이센스 등급을 선택하세요", options=options, custom_id="dinobot:license:purchase")
+        async def callback(self, interaction: discord.Interaction):
+            tier = _plan(self.values[0])
+            if not tier:
+                return await interaction.response.send_message("❌ 잘못된 등급입니다.", ephemeral=True)
+            await deliver(interaction, tier, free=False)
+
+    class VendingView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=None)
+            self.add_item(FreeTrialButton())
+            self.add_item(PurchaseSelect())
+
+    @bot.tree.command(name="라이센스자판기", description="무료체험 또는 포인트로 라이센스를 발급받습니다.")
     async def license_vending(interaction: discord.Interaction):
-        key = await first_free(interaction.user.id, interaction.guild_id)
-        if not key:
-            return await interaction.response.send_message("⚠️ 이 Discord 계정은 최초 1회 무료 발급을 이미 사용했습니다.", ephemeral=True)
-        e = discord.Embed(title="🎁 무료 라이센스 발급", description=f"발급 키: `{key}`", color=discord.Color.green())
-        e.add_field(name="등급", value="브론즈", inline=True)
-        e.add_field(name="기간", value="30일", inline=True)
-        e.set_footer(text="계정당 최초 1회만 무료")
+        balance = "무제한" if is_unlimited(interaction.user.id) else f"{await get_balance(interaction.user.id):,}P"
+        e = discord.Embed(
+            title="🎰 DinoBot 라이센스 자판기",
+            description=(
+                "아래 버튼에서 원하는 기능을 선택하세요.\n\n"
+                "🎁 **무료체험 1달** — 계정당 최초 1회, 브론즈 30일\n"
+                "🛒 **라이센스 구매** — 포인트로 30일 라이센스 구매\n\n"
+                "🥉 브론즈 · **100P**\n🥈 실버 · **300P**\n🥇 골드 · **500P**\n💎 플래티넘 · **1,000P**"
+            ),
+            color=discord.Color.blurple(),
+        )
+        e.add_field(name="현재 포인트", value=balance, inline=False)
+        e.set_footer(text="DinoBot License Center · 라이센스 발급은 자판기에서만 가능합니다")
+        await interaction.response.send_message(embed=e, view=VendingView())
+
+    @bot.tree.command(name="라이센스등급", description="라이센스 등급별 혜택과 가격을 확인합니다.")
+    async def license_tiers(interaction: discord.Interaction):
+        e = discord.Embed(title="💎 DinoBot 라이센스 등급", description="모든 유료 라이센스는 30일 기준입니다.", color=discord.Color.blurple())
+        for k, p in PLANS.items():
+            e.add_field(name=f"{p['name']} · {p['price']:,}P", value=f"30일 이용 · 등급 코드 `{k}`", inline=True)
+        e.add_field(name="🎁 무료체험", value="Discord 계정당 최초 1회 · 브론즈 30일 무료", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     @bot.tree.command(name="라이센스정보", description="라이센스 키의 상태를 확인합니다.")
@@ -168,5 +254,7 @@ def install(core) -> None:
     async def dashboard_licenses(request: Request):
         if not request.session.get("user_id"):
             return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard/login'>")
-        cards = "".join(f"<div class='card'><b>{p['name']}</b><span>{p['days']}일 기본</span><small>{k.upper()}</small></div>" for k,p in PLANS.items())
-        return HTMLResponse(f"""<!doctype html><html lang='ko'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>DinoBot · License</title><style>:root{{color-scheme:dark}}body{{margin:0;background:#070a10;color:#f5f7fb;font-family:Inter,Pretendard,system-ui;padding:28px}}main{{max-width:1100px;margin:auto}}.hero{{padding:28px;border:1px solid #202938;border-radius:22px;background:#0d121b}}h1{{margin:0 0 8px;font-size:34px}}p{{color:#8f9bb2}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-top:18px}}.card{{padding:22px;border:1px solid #202938;border-radius:18px;background:#0d121b;display:grid;gap:9px}}.card span{{color:#a9b3c4}}small{{color:#66758d;letter-spacing:.12em}}a{{color:#fff;text-decoration:none}}.pill{{display:inline-block;padding:7px 10px;border-radius:999px;background:#182138;color:#aebcff;font-size:12px}}</style><main><section class='hero'><span class='pill'>LICENSE CENTER</span><h1>DinoBot 라이센스 센터</h1><p>Discord 내부 명령어와 동일한 등급 체계로 관리됩니다. 계정당 최초 1회 브론즈 30일이 무료입니다.</p></section><section class='grid'>{cards}</section></main></html>""")
+        cards = "".join(f"<div class='card'><b>{p['name']}</b><strong>{p['price']:,}P</strong><span>{p['days']}일</span><small>{k.upper()}</small></div>" for k,p in PLANS.items())
+        return HTMLResponse(f"""<!doctype html><html lang='ko'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>DinoBot · License</title><style>:root{{color-scheme:dark}}body{{margin:0;background:#070a10;color:#f5f7fb;font-family:Inter,Pretendard,system-ui;padding:28px}}main{{max-width:1100px;margin:auto}}.hero{{padding:28px;border:1px solid #202938;border-radius:22px;background:#0d121b}}h1{{margin:0 0 8px;font-size:34px}}p{{color:#8f9bb2;line-height:1.7}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-top:18px}}.card{{padding:22px;border:1px solid #202938;border-radius:18px;background:#0d121b;display:grid;gap:9px}}.card strong{{font-size:26px}}.card span{{color:#a9b3c4}}small{{color:#66758d;letter-spacing:.12em}}.free{{margin-top:18px;padding:18px;border:1px solid #202938;border-radius:18px;background:#0d121b}}</style><main><section class='hero'><h1>🎰 DinoBot 라이센스 자판기</h1><p>계정당 최초 1회 브론즈 30일 무료체험을 제공하며, 이후에는 포인트로 원하는 등급을 구매합니다. 라이센스 발급은 자판기에서만 가능합니다.</p></section><section class='grid'>{cards}</section><section class='free'><b>🎁 무료체험</b><br><span>최초 1회 · 브론즈 · 30일 · 0P</span></section></main></html>""")
+
+    logger.info("License vending installed: issuance restricted to vending panel; free trial + paid four-tier purchase enabled")
