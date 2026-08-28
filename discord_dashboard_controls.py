@@ -91,13 +91,17 @@ def install(core):
         message_text = discord.ui.TextInput(label="쓸 글자", placeholder="인증하려면 아래 버튼을 눌러주세요.", style=discord.TextStyle.paragraph, max_length=4000, required=True)
 
         async def on_submit(self, interaction: discord.Interaction):
+            # Discord requires the initial interaction response within a short
+            # deadline. Persisting settings and sending the panel can involve DB
+            # and Discord API calls, so acknowledge immediately and use followup.
+            await interaction.response.defer(ephemeral=True)
             if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
-                return await interaction.response.send_message("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+                return await interaction.followup.send("❌ 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
             button = str(self.button_text.value).strip() or "인증하기"
             image = str(self.image_url.value).strip()
             text = str(self.message_text.value).strip()
             if image and not (image.startswith("https://") or image.startswith("http://")):
-                return await interaction.response.send_message("❌ 사진 URL은 http:// 또는 https:// URL이어야 합니다.", ephemeral=True)
+                return await interaction.followup.send("❌ 사진 URL은 http:// 또는 https:// URL이어야 합니다.", ephemeral=True)
 
             await _ensure_schema(DB)
             await DB.execute(
@@ -109,15 +113,16 @@ def install(core):
             )
 
             client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
-            redirect = os.getenv("VERIFY_REDIRECT_URI", "").strip() or os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/") + "/auth/callback"
-            params = {"client_id": client_id, "redirect_uri": redirect, "response_type": "code", "scope": "identify guilds.join"}
-            # VerificationView's state signing is used when available. The button
-            # below falls back to the canonical callback URL only if the shared view
-            # cannot be imported; normal installs always have it.
+            redirect = os.getenv("VERIFY_REDIRECT_URI", "").strip() or os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").rstrip("/") + "/dashboard/callback"
+            params = {"client_id": client_id, "redirect_uri": redirect, "response_type": "code", "scope": "identify guilds.join", "prompt": "consent"}
             try:
                 view = core.VerifyView(interaction.guild.id, button_label=button)
             except Exception:
-                oauth = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
+                # Compatibility fallback for deployments where the verification
+                # module has not yet installed VerifyView. Keep the canonical
+                # callback URL; never fall back to the obsolete /auth/callback.
+                core.logger.exception("VerifyView construction failed; using canonical OAuth fallback")
+                oauth = "https://discord.com/oauth2/authorize?" + urlencode(params)
                 view = discord.ui.View(timeout=None)
                 view.add_item(discord.ui.Button(label=button, style=discord.ButtonStyle.link, url=oauth))
 
@@ -126,10 +131,10 @@ def install(core):
                 try:
                     embed.set_image(url=image)
                 except Exception:
-                    return await interaction.response.send_message("❌ 이미지 URL을 사용할 수 없습니다.", ephemeral=True)
+                    return await interaction.followup.send("❌ 이미지 URL을 사용할 수 없습니다.", ephemeral=True)
             embed.set_footer(text="DinoBot 인증")
             await interaction.channel.send(embed=embed, view=view)
-            await interaction.response.send_message("✅ 인증패널을 전송했습니다. 표시 순서: 글자 → 사진 → 버튼", ephemeral=True)
+            await interaction.followup.send("✅ 인증패널을 전송했습니다. 표시 순서: 글자 → 사진 → 버튼", ephemeral=True)
 
     @app_commands.command(name="인증패널전송", description="글자·사진·버튼을 설정해 인증패널을 전송합니다.")
     @app_commands.guild_only()
@@ -137,7 +142,13 @@ def install(core):
         if not await admin(interaction): return
         await interaction.response.send_modal(VerificationPanelModal())
 
-    # Avoid duplicate registrations when another installer already owns one of
-    # these commands; main.py's global guard will safely replace same-name commands.
+    # verification_features.py owns the canonical /인증패널전송 and
+    # /인증설정상태 implementations. Preserve this module's implementations
+    # for compatibility, but never replace an already-installed command. This
+    # prevents the older non-deferred modal implementation from winning startup
+    # registration and causing 10062 Unknown interaction after a slow DB/API call.
     for command in (verification_captcha, verification_ip, verification_log_channel, verification_status, verification_panel):
-        bot.tree.add_command(command)
+        if bot.tree.get_command(command.name) is None:
+            bot.tree.add_command(command)
+        else:
+            core.logger.info("Keeping existing slash command /%s; duplicate installer skipped", command.name)
