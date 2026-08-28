@@ -22,6 +22,38 @@ import core
 # Single canonical tier vocabulary shared by dashboard, Discord commands and DB.
 core.TIER_LABEL = {"bronze": "브론즈", "silver": "실버", "gold": "골드", "platinum": "플래티넘"}
 core.TIER_ORDER = {"bronze": 1, "silver": 2, "gold": 3, "platinum": 4}
+
+# -----------------------------------------------------------------------------
+# Global command-registration guard
+# -----------------------------------------------------------------------------
+# Multiple feature installers are loaded during one process. Discord.py raises
+# CommandAlreadyRegistered when two installers expose the same slash command or
+# when an installer is invoked again during a startup/retry path. Replace an
+# existing command atomically instead of crashing the entire Render service.
+# This affects only same-name/same-type collisions; unrelated commands are kept.
+_bot_tree = core.bot.tree
+_original_add_command = _bot_tree.add_command
+
+
+def _safe_add_command(command, *args, **kwargs):
+    try:
+        existing = _bot_tree.get_command(command.name, type=command.type)
+        if existing is not None:
+            _bot_tree.remove_command(command.name, type=command.type)
+            core.logger.warning(
+                "Duplicate slash command replaced safely: /%s (%s)",
+                command.name,
+                getattr(command.type, "name", command.type),
+            )
+    except Exception:
+        # If inspection itself fails, let discord.py report the original error
+        # rather than hiding an unrelated programming error.
+        pass
+    return _original_add_command(command, *args, **kwargs)
+
+
+_bot_tree.add_command = _safe_add_command
+
 from startup_fixes import install as install_startup_fixes
 from security_hardening import install as install_security_hardening
 from web_entry import install as install_web_entry
