@@ -23,7 +23,6 @@ import core
 core.TIER_LABEL = {"bronze": "브론즈", "silver": "실버", "gold": "골드", "platinum": "플래티넘"}
 core.TIER_ORDER = {"bronze": 1, "silver": 2, "gold": 3, "platinum": 4}
 
-# discord.py app_commands.Command has no .type attribute. Use the supported lookup API.
 _bot_tree = core.bot.tree
 _original_add_command = _bot_tree.add_command
 
@@ -56,6 +55,7 @@ from unified_control import install as install_unified_control
 from license_manager import install as install_license_manager
 from license_lifecycle import install as install_license_lifecycle
 from discord_dashboard_controls import install as install_discord_dashboard_controls
+from support_vending_referrals import install as install_support_vending_referrals
 
 install_startup_fixes(core)
 install_security_hardening(core)
@@ -77,6 +77,7 @@ install_unified_control(core)
 install_license_manager(core)
 install_license_lifecycle(core)
 install_discord_dashboard_controls(core)
+install_support_vending_referrals(core)
 
 app = core.app
 bot = core.bot
