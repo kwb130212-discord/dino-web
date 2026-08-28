@@ -3,8 +3,7 @@
 import os
 
 # Canonical public origin. Discord OAuth2 must use this exact host and callback.
-# Keep this aligned with the URI registered in the Discord Developer Portal.
-PRIMARY_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dino-web-2trw.onrender.com").strip().rstrip("/")
+PRIMARY_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").strip().rstrip("/")
 FALLBACK_BASE_URL = PRIMARY_BASE_URL
 PRODUCTION_BASE_URL = PRIMARY_BASE_URL
 
@@ -13,8 +12,7 @@ os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
 
 # Keep all OAuth consumers on one canonical callback. An explicit
-# DISCORD_REDIRECT_URI is supported for a registered custom domain, but never
-# derive this URI from request Host headers or Render's internal hostname.
+# DISCORD_REDIRECT_URI is supported, but defaults to the registered custom domain.
 REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback").strip().rstrip("/")
 os.environ["REDIRECT_URI"] = REDIRECT_URI
 os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
