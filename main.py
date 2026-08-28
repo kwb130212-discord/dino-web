@@ -2,29 +2,20 @@
 """DinoBot production entrypoint and canonical public URL configuration."""
 import os
 
-# One canonical public origin. Internal bind addresses/ports are intentionally untouched.
 PRIMARY_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").strip().rstrip("/")
 if not PRIMARY_BASE_URL.startswith(("http://", "https://")):
     PRIMARY_BASE_URL = "https://" + PRIMARY_BASE_URL
 FALLBACK_BASE_URL = PRIMARY_BASE_URL
 PRODUCTION_BASE_URL = PRIMARY_BASE_URL
-
 os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-
-# Dashboard and verification now use the same Discord OAuth2 callback.
-CANONICAL_REDIRECT_URI = os.getenv(
-    "DISCORD_REDIRECT_URI",
-    f"{PRODUCTION_BASE_URL}/dashboard/callback",
-).strip().rstrip("/")
+CANONICAL_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback").strip().rstrip("/")
 os.environ["REDIRECT_URI"] = CANONICAL_REDIRECT_URI
 os.environ["DASHBOARD_REDIRECT_URI"] = CANONICAL_REDIRECT_URI
 os.environ["DISCORD_REDIRECT_URI"] = CANONICAL_REDIRECT_URI
 os.environ["VERIFY_REDIRECT_URI"] = CANONICAL_REDIRECT_URI
-os.environ["TRIAL_REDIRECT_URI"] = os.getenv(
-    "TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback"
-).strip().rstrip("/")
+os.environ["TRIAL_REDIRECT_URI"] = os.getenv("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback").strip().rstrip("/")
 
 import uvicorn
 import core
@@ -32,18 +23,16 @@ import core
 core.TIER_LABEL = {"bronze": "브론즈", "silver": "실버", "gold": "골드", "platinum": "플래티넘"}
 core.TIER_ORDER = {"bronze": 1, "silver": 2, "gold": 3, "platinum": 4}
 
-# Protect startup from accidental duplicate app-command registration.
+# discord.py app_commands.Command has no .type attribute. Use the supported lookup API.
 _bot_tree = core.bot.tree
 _original_add_command = _bot_tree.add_command
 
-
 def _safe_add_command(command, *args, **kwargs):
-    existing = _bot_tree.get_command(command.name, type=command.type)
+    existing = _bot_tree.get_command(command.name)
     if existing is not None:
-        _bot_tree.remove_command(command.name, type=command.type)
+        _bot_tree.remove_command(command.name)
         core.logger.warning("Duplicate slash command replaced safely: /%s", command.name)
     return _original_add_command(command, *args, **kwargs)
-
 
 _bot_tree.add_command = _safe_add_command
 
@@ -93,10 +82,4 @@ app = core.app
 bot = core.bot
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        proxy_headers=True,
-        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"),
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), proxy_headers=True, forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"))
