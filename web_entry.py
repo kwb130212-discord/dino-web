@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 # One public origin for the entire production service. Never fall back to a
 # provider hostname here: OAuth redirect URIs must use the registered custom
 # domain exactly.
-BASE_URL = "https://dinobotservice.64bit.kr"
+BASE_URL = (os.getenv("DINO_PUBLIC_BASE_URL") or "https://dino-web-2trw.onrender.com").strip().rstrip("/")
 os.environ["DINO_PUBLIC_BASE_URL"] = BASE_URL
 
 

@@ -20,7 +20,11 @@ log = logging.getLogger("DinoBot.Auth")
 
 # Single source of truth for the production Dashboard OAuth callback.
 # This MUST exactly match a Redirect URI registered in Discord Developer Portal.
-CANONICAL_DASHBOARD_REDIRECT_URI = "https://dinobotservice.64bit.kr/dashboard/callback"
+# The default is the current DinoBot Render service; a registered custom domain
+# can be supplied explicitly with DISCORD_REDIRECT_URI.
+DEFAULT_PUBLIC_BASE_URL = "https://dino-web-2trw.onrender.com"
+PUBLIC_BASE_URL = (os.getenv("DINO_PUBLIC_BASE_URL") or DEFAULT_PUBLIC_BASE_URL).strip().rstrip("/")
+CANONICAL_DASHBOARD_REDIRECT_URI = (os.getenv("DISCORD_REDIRECT_URI") or f"{PUBLIC_BASE_URL}/dashboard/callback").strip().rstrip("/")
 REDIRECT_URI = CANONICAL_DASHBOARD_REDIRECT_URI
 
 
@@ -56,13 +60,16 @@ def install(core) -> None:
     app = core.app
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     client_secret = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
-    redirect_uri = CANONICAL_DASHBOARD_REDIRECT_URI
+    # Never construct the OAuth URI from the incoming request host. Discord
+    # compares redirect_uri byte-for-byte with the registered application URI.
+    redirect_uri = REDIRECT_URI
 
     # Process-wide compatibility for older modules. Never derive OAuth redirect
     # URIs from Host headers or Render's internal service hostname.
-    os.environ["DINO_PUBLIC_BASE_URL"] = "https://dinobotservice.64bit.kr"
+    os.environ["DINO_PUBLIC_BASE_URL"] = PUBLIC_BASE_URL
     os.environ["REDIRECT_URI"] = redirect_uri
     os.environ["DASHBOARD_REDIRECT_URI"] = redirect_uri
+    os.environ["DISCORD_REDIRECT_URI"] = redirect_uri
 
     def oauth_diag(request: Request, stage: str, **extra):
         try:
