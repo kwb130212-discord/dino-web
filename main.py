@@ -56,6 +56,7 @@ from unified_control import install as install_unified_control
 from license_manager import install as install_license_manager
 from license_lifecycle import install as install_license_lifecycle
 from discord_dashboard_controls import install as install_discord_dashboard_controls
+from support_vending import install as install_support_vending
 
 install_startup_fixes(core)
 install_security_hardening(core)
@@ -77,6 +78,7 @@ install_unified_control(core)
 install_license_manager(core)
 install_license_lifecycle(core)
 install_discord_dashboard_controls(core)
+install_support_vending(core)
 
 app = core.app
 bot = core.bot
