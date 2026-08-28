@@ -21,7 +21,7 @@ def install(core) -> None:
         return datetime.now(timezone.utc)
 
     def is_bot_operator(interaction: discord.Interaction) -> bool:
-        if interaction.user.guild_permissions.administrator:
+        if interaction.guild and interaction.user.guild_permissions.administrator:
             return True
         return any(getattr(r, "name", "") == "! !디노" for r in getattr(interaction.user, "roles", []))
 
@@ -129,5 +129,16 @@ def install(core) -> None:
     async def before_expiry_loop():
         await bot.wait_until_ready()
 
-    if not expiry_loop.is_running():
-        expiry_loop.start()
+    # main.py imports modules before discord.py has a running event loop.
+    # Starting a tasks.Loop during import raises RuntimeError on Render.
+    # Start it only after the bot has emitted on_ready.
+    @bot.listen("on_ready")
+    async def _license_lifecycle_ready():
+        if not expiry_loop.is_running():
+            try:
+                expiry_loop.start()
+                logger.info("License expiry loop started after Discord ready")
+            except RuntimeError:
+                logger.exception("License expiry loop could not be started")
+
+    logger.info("License lifecycle installed; expiry loop deferred until Discord on_ready")
