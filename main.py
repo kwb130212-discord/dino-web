@@ -40,6 +40,7 @@ from ip_analyzer import install as install_ip_analyzer
 from verification_features import install as install_verification_features
 from unified_control import install as install_unified_control
 from license_manager import install as install_license_manager
+from license_lifecycle import install as install_license_lifecycle
 
 install_startup_fixes(core)
 install_security_hardening(core)
@@ -59,6 +60,7 @@ install_ip_analyzer(core)
 install_verification_features(core)
 install_unified_control(core)
 install_license_manager(core)
+install_license_lifecycle(core)
 
 app = core.app
 bot = core.bot
