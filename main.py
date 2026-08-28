@@ -2,22 +2,17 @@
 """DinoBot production entrypoint and canonical public URL configuration."""
 import os
 
-# Canonical public origin. Discord OAuth2 must use this exact host and callback.
+# Canonical production origin. Discord OAuth2 redirect URIs use this exact domain.
 PRIMARY_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").strip().rstrip("/")
 FALLBACK_BASE_URL = PRIMARY_BASE_URL
 PRODUCTION_BASE_URL = PRIMARY_BASE_URL
-
 os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
 os.environ["DINO_FALLBACK_BASE_URL"] = FALLBACK_BASE_URL
 os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-
-# Keep all OAuth consumers on one canonical callback. An explicit
-# DISCORD_REDIRECT_URI is supported, but defaults to the registered custom domain.
 REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/dashboard/callback").strip().rstrip("/")
 os.environ["REDIRECT_URI"] = REDIRECT_URI
 os.environ["DASHBOARD_REDIRECT_URI"] = REDIRECT_URI
 os.environ["DISCORD_REDIRECT_URI"] = REDIRECT_URI
-
 VERIFY_REDIRECT_URI = os.getenv("VERIFY_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/auth/callback").strip().rstrip("/")
 os.environ["VERIFY_REDIRECT_URI"] = VERIFY_REDIRECT_URI
 os.environ["TRIAL_REDIRECT_URI"] = os.getenv("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback").strip().rstrip("/")
@@ -41,6 +36,7 @@ from dashboard_v4 import install as install_dashboard_v4
 from ip_analyzer import install as install_ip_analyzer
 from verification_features import install as install_verification_features
 from unified_control import install as install_unified_control
+from license_manager import install as install_license_manager
 
 install_startup_fixes(core)
 install_security_hardening(core)
@@ -59,15 +55,10 @@ install_dashboard_v4(core)
 install_ip_analyzer(core)
 install_verification_features(core)
 install_unified_control(core)
+install_license_manager(core)
 
 app = core.app
 bot = core.bot
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        proxy_headers=True,
-        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*")
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), proxy_headers=True, forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"))
