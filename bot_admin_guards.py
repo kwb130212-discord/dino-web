@@ -25,15 +25,19 @@ def install(core) -> None:
             await interaction.response.send_message(message, ephemeral=True)
         return False
 
-    # Do not mutate Command.callback: discord.py exposes it as a read-only property.
-    # The privileged vending command is registered with its own permission callback.
+    # Do not mutate Command.callback: discord.py exposes it as a read-only
+    # property. Do not clear existing checks either: other installers may have
+    # attached useful permission/context checks. Add our guard idempotently.
     command = bot.tree.get_command("서포트자판기")
     if command is not None:
-        try:
-            command.checks.clear()
-        except AttributeError:
-            pass
-        command.add_check(operator_only)
+        marker = "_dinobot_operator_guard_installed"
+        if not getattr(command, marker, False):
+            command.add_check(operator_only)
+            setattr(command, marker, True)
         log.info("Bot-admin guard installed: /서포트자판기")
     else:
         log.warning("/서포트자판기 was not found while installing bot-admin guard")
+
+    # Expose the same policy to other modules without importing this module
+    # again, so persistent UI callbacks can enforce the bot-operator boundary.
+    core.is_bot_operator = lambda user_id: int(user_id) in operator_ids()
