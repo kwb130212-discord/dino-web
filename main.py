@@ -39,6 +39,7 @@ from security_hardening import install as install_security_hardening
 from web_entry import install as install_web_entry
 from dashboard_auth import install as install_dashboard_auth
 from oauth_state_runtime_fix import install as install_oauth_state_runtime_fix
+from verification_audit_runtime import install as install_verification_audit
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
@@ -69,6 +70,7 @@ install_security_hardening(core)
 install_web_entry(core)
 install_dashboard_auth(core)
 install_oauth_state_runtime_fix(core)
+install_verification_audit(core)
 install_control_center(core)
 install_tutorial_logs(core)
 install_ticket_control(core)
@@ -94,10 +96,4 @@ app = core.app
 bot = core.bot
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        proxy_headers=True,
-        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"),
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), proxy_headers=True, forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"))
