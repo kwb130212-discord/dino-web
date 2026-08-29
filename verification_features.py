@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DinoBot verification subsystem."""
+"""Canonical verification helpers and interactive CAPTCHA gate."""
 from __future__ import annotations
 
 import base64
@@ -8,35 +8,28 @@ import hmac
 import json
 import logging
 import os
+import random
 import time
 from typing import Optional
 from urllib.parse import urlencode
 
 import discord
-from discord import app_commands
 
 log = logging.getLogger("DinoBot.Verification")
-
 PUBLIC_BASE_URL = (os.getenv("DINO_PUBLIC_BASE_URL") or "https://dinobotservice.64bit.kr").strip().rstrip("/")
 CANONICAL_CALLBACK = f"{PUBLIC_BASE_URL}/dashboard/callback"
 
 
 def _oauth_secret() -> bytes:
-    return (os.getenv("SESSION_SECRET") or os.getenv("DISCORD_CLIENT_SECRET") or "").encode("utf-8")
+    return (os.getenv("OAUTH_STATE_SECRET") or os.getenv("SESSION_SECRET") or os.getenv("DISCORD_CLIENT_SECRET") or "").encode("utf-8")
 
 
 def _make_verify_state(guild_id: int) -> str:
-    payload = {
-        "v": 5,
-        "purpose": "verification",
-        "guild_id": str(guild_id),
-        "iat": int(time.time()),
-        "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("="),
-    }
+    payload = {"v": 6, "purpose": "verification", "guild_id": str(guild_id), "iat": int(time.time()), "nonce": base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")}
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     secret = _oauth_secret()
     if not secret:
-        raise RuntimeError("SESSION_SECRET 또는 DISCORD_CLIENT_SECRET이 필요합니다.")
+        raise RuntimeError("OAUTH_STATE_SECRET, SESSION_SECRET 또는 DISCORD_CLIENT_SECRET이 필요합니다.")
     sig = hmac.new(secret, raw, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(raw + b"." + sig).decode().rstrip("=")
 
@@ -45,146 +38,87 @@ def _oauth_url(guild_id: Optional[int]) -> str:
     client_id = os.getenv("DISCORD_CLIENT_ID", "").strip()
     if not client_id:
         raise RuntimeError("DISCORD_CLIENT_ID가 설정되지 않았습니다.")
-    params = {
-        "client_id": client_id,
-        "redirect_uri": CANONICAL_CALLBACK,
-        "response_type": "code",
-        "scope": "identify guilds.join",
-        "prompt": "consent",
-    }
+    params = {"client_id": client_id, "redirect_uri": CANONICAL_CALLBACK, "response_type": "code", "scope": "identify guilds", "prompt": "consent"}
     if guild_id is not None:
         params["state"] = _make_verify_state(guild_id)
     return "https://discord.com/oauth2/authorize?" + urlencode(params)
 
 
-class VerificationView(discord.ui.View):
-    """Persistent verification panel containing a Discord OAuth2 link."""
+async def _audit(core, guild_id: int, user_id: int, event: str, captcha_passed: int = 0) -> None:
+    try:
+        await core.DB.execute(
+            "CREATE TABLE IF NOT EXISTS verification_logs (id SERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, event TEXT NOT NULL, captcha_passed INTEGER DEFAULT 0, ip_address TEXT, created_at TEXT NOT NULL)"
+        )
+        await core.DB.execute(
+            "INSERT INTO verification_logs (guild_id,user_id,event,captcha_passed,ip_address,created_at) VALUES (%s,%s,%s,%s,%s,%s)",
+            guild_id, user_id, event, captcha_passed, None, discord.utils.utcnow().isoformat(),
+        )
+    except Exception:
+        log.exception("verification audit event failed guild=%s user=%s event=%s", guild_id, user_id, event)
 
+
+class CaptchaModal(discord.ui.Modal, title="DinoBot CAPTCHA"):
+    answer = discord.ui.TextInput(label="계산 결과를 입력하세요", placeholder="예: 17", max_length=8, required=True)
+
+    def __init__(self, guild_id: int, button_label: str):
+        super().__init__()
+        self.guild_id = guild_id
+        self.button_label = button_label
+        self.a = random.randint(2, 18)
+        self.b = random.randint(2, 18)
+        self.op = random.choice(("+", "-", "×"))
+        self.expected = self.a + self.b if self.op == "+" else self.a - self.b if self.op == "-" else self.a * self.b
+        self.answer.label = f"{self.a} {self.op} {self.b} = ?"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            supplied = int(str(self.answer.value).strip())
+        except ValueError:
+            supplied = None
+        core = getattr(interaction.client, "core", None)
+        if supplied != self.expected:
+            await interaction.response.send_message("❌ CAPTCHA가 틀렸습니다. 인증 버튼을 다시 눌러주세요.", ephemeral=True)
+            if core:
+                await _audit(core, self.guild_id, interaction.user.id, "captcha_failed", 0)
+            return
+        if core:
+            await _audit(core, self.guild_id, interaction.user.id, "captcha_passed", 1)
+        url = _oauth_url(self.guild_id)
+        view = discord.ui.View(timeout=120)
+        view.add_item(discord.ui.Button(label=self.button_label[:80], style=discord.ButtonStyle.link, url=url))
+        await interaction.response.send_message("✅ CAPTCHA 통과. 아래 버튼으로 Discord 인증을 계속하세요.", view=view, ephemeral=True)
+
+
+class VerificationGateButton(discord.ui.Button):
+    def __init__(self, guild_id: int, button_label: str):
+        self.guild_id = guild_id
+        self.button_label = button_label
+        super().__init__(label=(button_label or "인증하기")[:80], style=discord.ButtonStyle.primary, custom_id=f"dinobot:verify:{guild_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        core = getattr(interaction.client, "core", None)
+        try:
+            row = await core.DB.fetchone("SELECT verification_captcha_enabled FROM guild_settings WHERE guild_id=%s", self.guild_id) if core else None
+        except Exception:
+            row = None
+        captcha_enabled = bool(int((row or {}).get("verification_captcha_enabled") or 0))
+        if captcha_enabled:
+            return await interaction.response.send_modal(CaptchaModal(self.guild_id, self.button_label))
+        url = _oauth_url(self.guild_id)
+        view = discord.ui.View(timeout=120)
+        view.add_item(discord.ui.Button(label=self.button_label[:80], style=discord.ButtonStyle.link, url=url))
+        await interaction.response.send_message("아래 버튼을 눌러 Discord 인증을 진행하세요.", view=view, ephemeral=True)
+
+
+class VerificationView(discord.ui.View):
+    """Persistent verification panel. CAPTCHA is checked at click time."""
     def __init__(self, guild_id: Optional[int] = None, button_label: str = "인증하기"):
         super().__init__(timeout=None)
         self.guild_id = guild_id
-        self.add_item(
-            discord.ui.Button(
-                label=(button_label or "인증하기")[:80],
-                style=discord.ButtonStyle.link,
-                url=_oauth_url(guild_id),
-            )
-        )
-
-
-class VerificationPanelModal(discord.ui.Modal, title="인증패널 전송"):
-    """Single canonical modal used by both /인증패널전송 and /인증패널생성."""
-
-    button_text = discord.ui.TextInput(
-        label="버튼 TEXT",
-        placeholder="예: 인증하기",
-        default="인증하기",
-        max_length=80,
-        required=True,
-    )
-    top_text = discord.ui.TextInput(
-        label="사진 위 글자 (선택)",
-        placeholder="사진 위에 표시할 문구",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=2000,
-    )
-    image_url = discord.ui.TextInput(
-        label="사진 URL (선택)",
-        placeholder="https://example.com/image.png",
-        required=False,
-        max_length=1000,
-    )
-    bottom_text = discord.ui.TextInput(
-        label="사진 아래 글자 (선택)",
-        placeholder="사진 아래에 표시할 문구",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=2000,
-    )
-
-    def __init__(self, core):
-        super().__init__()
-        self.core = core
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
-            return await interaction.response.send_message(
-                "❌ 서버의 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True
-            )
-        if not isinstance(interaction.user, discord.Member) or not await self.core.is_server_admin(
-            interaction.user, interaction.guild.id
-        ):
-            return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
-
-        button_text = str(self.button_text.value).strip() or "인증하기"
-        top_text = str(self.top_text.value).strip()
-        image_url = str(self.image_url.value).strip()
-        bottom_text = str(self.bottom_text.value).strip()
-        if image_url and not image_url.startswith(("https://", "http://")):
-            return await interaction.response.send_message(
-                "❌ 사진 URL은 http:// 또는 https://로 시작해야 합니다.", ephemeral=True
-            )
-
-        # Acknowledge the modal immediately. Discord invalidates an interaction
-        # if the first response takes too long while DB/API work is running.
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        try:
-            await self.core.DB.execute(
-                "ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_image_url TEXT"
-            )
-            await self.core.DB.execute(
-                """INSERT INTO guild_settings
-                   (guild_id, verify_button_text, verify_description, verify_image_url)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (guild_id) DO UPDATE SET
-                     verify_button_text=EXCLUDED.verify_button_text,
-                     verify_description=EXCLUDED.verify_description,
-                     verify_image_url=EXCLUDED.verify_image_url""",
-                interaction.guild.id,
-                button_text,
-                (top_text + "\n\n" + bottom_text).strip(),
-                image_url or None,
-            )
-
-            # Deterministic order: optional text above, image, optional text below + button.
-            if top_text:
-                await interaction.channel.send(top_text)
-
-            if image_url:
-                image_embed = discord.Embed(color=discord.Color.blurple())
-                image_embed.set_image(url=image_url)
-                await interaction.channel.send(embed=image_embed)
-
-            view = VerificationView(interaction.guild.id, button_text)
-            if bottom_text:
-                await interaction.channel.send(bottom_text, view=view)
-            else:
-                await interaction.channel.send("인증이 필요하면 아래 버튼을 눌러주세요.", view=view)
-
-        except (discord.HTTPException, discord.Forbidden, RuntimeError, ValueError) as exc:
-            log.exception("verification panel send failed: %s", exc)
-            try:
-                await interaction.followup.send(
-                    "❌ 인증패널 전송에 실패했습니다. 봇의 메시지 권한, 사진 URL, OAuth 설정을 확인해주세요.",
-                    ephemeral=True,
-                )
-            except discord.HTTPException:
-                log.exception("failed to send verification panel error followup")
-            return
-        except Exception as exc:
-            log.exception("verification panel unexpected failure: %s", exc)
-            try:
-                await interaction.followup.send("❌ 인증패널 생성 중 오류가 발생했습니다.", ephemeral=True)
-            except discord.HTTPException:
-                log.exception("failed to send verification panel unexpected-error followup")
-            return
-
-        await interaction.followup.send(
-            "✅ 인증패널을 전송했습니다.\n순서: 사진 위 글자(선택) → 사진(선택) → 사진 아래 글자(선택) → 버튼",
-            ephemeral=True,
-        )
+        if guild_id is not None:
+            self.add_item(VerificationGateButton(guild_id, button_label))
+        else:
+            self.add_item(discord.ui.Button(label=(button_label or "인증하기")[:80], style=discord.ButtonStyle.link, url=_oauth_url(None)))
 
 
 async def _assign_verify_role(core, guild_id: int, user_id: int) -> tuple[bool, str]:
@@ -219,70 +153,16 @@ async def _assign_verify_role(core, guild_id: int, user_id: int) -> tuple[bool, 
 
 
 def install(core) -> None:
-    bot, DB = core.bot, core.DB
     core.VerifyView = VerificationView
+    core.bot.core = core
     core.assign_verify_role = lambda guild_id, user_id: _assign_verify_role(core, guild_id, user_id)
 
-    @bot.tree.command(name="인증역할설정", description="인증 완료 역할을 설정합니다.")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(역할="인증 완료 시 부여할 일반 역할")
-    async def set_verify_role(interaction: discord.Interaction, 역할: discord.Role):
-        guild = interaction.guild
-        if guild is None or not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
-        me = guild.me
-        if me is None and bot.user:
-            me = await guild.fetch_member(bot.user.id)
-        if me is None or 역할.is_default() or 역할.managed or 역할 >= me.top_role:
-            return await interaction.response.send_message("❌ 봇의 최고 역할보다 아래의 일반 역할만 지정할 수 있습니다.", ephemeral=True)
-        await DB.execute(
-            """INSERT INTO guild_settings (guild_id, verify_role_id)
-               VALUES (%s,%s)
-               ON CONFLICT (guild_id) DO UPDATE SET verify_role_id=EXCLUDED.verify_role_id""",
-            guild.id, 역할.id,
-        )
-        await interaction.response.send_message(f"✅ 인증 역할을 {역할.mention}으로 설정했습니다.", ephemeral=True)
-
-    async def _send_panel_command(interaction: discord.Interaction):
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
-        if not await core.is_server_admin(interaction.user, interaction.guild.id):
-            return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
-        await interaction.response.send_modal(VerificationPanelModal(core))
-
-    @app_commands.command(name="인증패널전송", description="글자·사진·버튼을 설정해 인증패널을 전송합니다.")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def send_panel(interaction: discord.Interaction):
-        await _send_panel_command(interaction)
-
-    @app_commands.command(name="인증패널생성", description="글자·사진·버튼을 설정해 인증패널을 생성합니다.")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def create_panel(interaction: discord.Interaction):
-        await _send_panel_command(interaction)
-
-    @app_commands.command(name="인증설정상태", description="현재 인증패널 설정을 확인합니다.")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def panel_status(interaction: discord.Interaction):
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
-            return await interaction.response.send_message("❌ 서버 관리 권한이 필요합니다.", ephemeral=True)
-        await DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_image_url TEXT")
-        row = await DB.fetchone(
-            """SELECT verify_button_text, verify_description, verify_image_url, verify_role_id
-               FROM guild_settings WHERE guild_id=%s""", interaction.guild.id,
-        ) or {}
-        embed = discord.Embed(title="DinoBot 인증 설정", color=discord.Color.blurple())
-        embed.add_field(name="버튼", value=str(row.get("verify_button_text") or "인증하기"), inline=False)
-        embed.add_field(name="글자", value=str(row.get("verify_description") or "미설정")[:1024], inline=False)
-        embed.add_field(name="사진", value=str(row.get("verify_image_url") or "없음")[:1024], inline=False)
-        embed.add_field(name="인증 역할", value=f"<@&{row.get('verify_role_id')}>" if row.get("verify_role_id") else "미설정", inline=False)
-        embed.add_field(name="OAuth2 콜백", value=CANONICAL_CALLBACK, inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    for command in (send_panel, create_panel, panel_status):
-        bot.tree.add_command(command)
-
-    log.info("Verification subsystem installed with canonical OAuth2 callback %s", CANONICAL_CALLBACK)
+    async def restore_persistent_views():
+        try:
+            for guild in core.bot.guilds:
+                row = await core.DB.fetchone("SELECT verify_button_text FROM guild_settings WHERE guild_id=%s", guild.id) or {}
+                core.bot.add_view(VerificationView(guild.id, str(row.get("verify_button_text") or "인증하기")))
+        except Exception:
+            log.exception("verification persistent views restore failed")
+    core.bot.add_listener(restore_persistent_views, "on_ready")
+    core.logger.info("Verification helpers installed: unified panel + optional CAPTCHA gate")
