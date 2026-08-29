@@ -51,7 +51,6 @@ def install(core):
         uid,_,err=await auth(request)
         if err:return err
         guilds=[]; seen=set()
-        # OAuth session is the source of truth; merge with bot cache so users never enter IDs manually.
         for x in (request.session.get('owned_guilds') or []):
             gid=str(x.get('id',''))
             if gid and gid not in seen:
@@ -96,10 +95,18 @@ def install(core):
         body=f"<div class='shell'>{side(guild_id)}<main class='main'><div class='top'><div><h1>{titles[kind]}</h1><div class='muted'>{esc(g.name)} · {desc[kind]}</div></div></div><div class='card'>{links}<h2>{titles[kind]}</h2><p class='muted'>{desc[kind]}</p><a class='btn primary' href='/dashboard/server/{guild_id}'>서버 개요로 이동</a></div></main></div>"
         return page(body,f'DinoBot · {titles[kind]}')
 
-    # Register only this dashboard implementation. The legacy v4 module is disabled in main.py.
+    async def callback_server_name(request: Request, server_name: str):
+        """Human-friendly dashboard shortcut; OAuth itself still uses the exact canonical callback."""
+        target = server_name.strip().casefold()
+        for guild in bot.guilds:
+            if guild.name.casefold() == target:
+                return RedirectResponse(f"/dashboard/server/{guild.id}")
+        return RedirectResponse('/dashboard')
+
     app.add_api_route('/dashboard',dashboard,methods=['GET'])
     app.add_api_route('/dashboard/server/{guild_id}',server,methods=['GET'])
     for k in ('vending','auth','settings'):
         app.add_api_route(f'/dashboard/server/{{guild_id}}/{k}',lambda request,guild_id,k=k: subpage(request,guild_id,k),methods=['GET'])
     app.add_api_route('/dashboard/server/{guild_id}/{rest:path}',lambda request,guild_id,rest: server(request,guild_id),methods=['GET'])
+    app.add_api_route('/dashboard/callback/{server_name}',callback_server_name,methods=['GET'])
     core.logger.info('Dashboard v5 installed: automatic server discovery + reliable navigation')
