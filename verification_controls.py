@@ -186,7 +186,13 @@ def install(core) -> None:
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     # discord.py 2.x exposes Command.callback as read-only. Construct a fresh
-    # command and let the idempotent tree.add_command wrapper handle duplicates.
+    # command and remove any legacy /인증설정 registration before adding the
+    # canonical interactive command. This prevents the legacy read-only status
+    # command from appearing alongside this editor after global synchronization.
+    try:
+        bot.tree.remove_command("인증설정", type=discord.AppCommandType.chat_input)
+    except (KeyError, ValueError, TypeError):
+        pass
     command = app_commands.Command(name="인증설정", description="CAPTCHA, IP 수집, 인증 로그 채널, 인증 역할을 한 번에 설정합니다.", callback=settings_command)
     bot.tree.add_command(command)
-    log.info("Interactive /인증설정 controls installed (save-and-run)")
+    log.info("Interactive /인증설정 controls installed (canonical single command, save-and-run)")
