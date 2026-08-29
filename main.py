@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """DinoBot production entrypoint."""
 import os
+import functools
 PRIMARY_BASE_URL=os.getenv("DINO_PUBLIC_BASE_URL","https://dinobotservice.64bit.kr").strip().rstrip("/")
 if not PRIMARY_BASE_URL.startswith(("http://","https://")): PRIMARY_BASE_URL="https://"+PRIMARY_BASE_URL
 PRODUCTION_BASE_URL=PRIMARY_BASE_URL
@@ -11,12 +12,64 @@ os.environ["TRIAL_REDIRECT_URI"]=os.getenv("TRIAL_REDIRECT_URI",f"{PRODUCTION_BA
 import uvicorn
 import core
 core.TIER_LABEL={"bronze":"브론즈","silver":"실버","gold":"골드","platinum":"플래티넘"}; core.TIER_ORDER={"bronze":1,"silver":2,"gold":3,"platinum":4}
-_bot_tree=core.bot.tree; _original_add_command=_bot_tree.add_command
+
+# Discord can contain both an old global command and the new guild command with
+# the same name. That is what caused the UI to show commands twice. DinoBot is
+# intentionally guild-scoped: global application commands are kept empty and
+# every installed guild receives exactly one canonical copy.
+_bot_tree=core.bot.tree
+_original_add_command=_bot_tree.add_command
+_original_sync=_bot_tree.sync
+
 def _safe_add_command(command,*args,**kwargs):
-    existing=_bot_tree.get_command(command.name)
-    if existing is not None and existing is not command: _bot_tree.remove_command(command.name); core.logger.warning("Duplicate slash command replaced safely: /%s",command.name)
+    guild=kwargs.get("guild")
+    if guild is None and not kwargs.get("guilds"):
+        existing=_bot_tree.get_command(command.name)
+        if existing is not None and existing is not command:
+            _bot_tree.remove_command(command.name)
+            core.logger.warning("Duplicate global slash command replaced safely: /%s",command.name)
+    else:
+        # Do not allow duplicate command names inside a guild-local registry.
+        existing=_bot_tree.get_command(command.name,guild=guild) if guild is not None else None
+        if existing is not None and existing is not command:
+            _bot_tree.remove_command(command.name,guild=guild)
+            core.logger.warning("Duplicate guild slash command replaced safely: /%s",command.name)
     return _original_add_command(command,*args,**kwargs)
+
 _bot_tree.add_command=_safe_add_command
+
+@functools.wraps(_original_sync)
+async def _canonical_sync(*, guild=None):
+    # Never publish global commands. If another legacy module calls sync() with
+    # no guild, this explicitly deletes the stale global registry instead.
+    if guild is None:
+        _bot_tree.clear_commands(guild=None)
+        result=await _original_sync(guild=None)
+        core.logger.info("Global slash-command registry enforced empty: %d commands",len(result))
+        return result
+
+    # Rebuild the target guild from the one canonical in-memory registry.
+    canonical=[]
+    seen=set()
+    for command in list(_bot_tree.get_commands()):
+        name=getattr(command,"name",None)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        canonical.append(command)
+
+    _bot_tree.clear_commands(guild=guild)
+    for command in canonical:
+        try:
+            _original_add_command(command,guild=guild,override=True)
+        except TypeError:
+            _original_add_command(command,guild=guild)
+    result=await _original_sync(guild=guild)
+    core.logger.info("Canonical guild slash commands synchronized: guild=%s count=%d",getattr(guild,"id",guild),len(result))
+    return result
+
+_bot_tree.sync=_canonical_sync
+
 from startup_fixes import install as install_startup_fixes
 from security_hardening import install as install_security_hardening
 from web_entry import install as install_web_entry
