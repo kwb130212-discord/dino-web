@@ -51,10 +51,6 @@ def install(core) -> None:
     def is_admin(interaction: discord.Interaction) -> bool:
         return bool(interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator)
 
-    # Runtime policy bridge.  It deliberately sits in front of the existing
-    # OAuth callback, so enabling CAPTCHA does not require changing Discord's
-    # OAuth redirect URI and enabling IP collection does not expose the address
-    # in Discord messages.
     @app.middleware("http")
     async def verification_runtime_policy(request, call_next):
         if request.url.path == "/dashboard/callback":
@@ -65,15 +61,13 @@ def install(core) -> None:
                 if payload and payload.get("purpose") == "verification" and str(payload.get("guild_id", "")).isdigit():
                     guild_id = int(payload["guild_id"])
                     row = await DB.fetchone(
-                        "SELECT verification_captcha_enabled, verification_ip_collection_enabled FROM guild_settings WHERE guild_id=%s",
+                        "SELECT verification_captcha_enabled, verification_ip_collection_enabled, verification_log_channel_id FROM guild_settings WHERE guild_id=%s",
                         guild_id,
                     ) or {}
                     captcha_enabled = bool(int(row.get("verification_captcha_enabled") or 0))
                     ip_enabled = bool(int(row.get("verification_ip_collection_enabled") or 0))
+                    log_channel_id = int(row.get("verification_log_channel_id") or 0)
 
-                    # CAPTCHA is checked before the callback consumes Discord's
-                    # one-time OAuth code. A failed/first attempt therefore can
-                    # safely be restarted without an invalid code race.
                     if captcha_enabled and request.query_params.get("code") and not request.session.get(f"verification_captcha_ok:{guild_id}"):
                         challenge = request.session.get(f"verification_captcha_challenge:{guild_id}")
                         if not challenge:
@@ -83,30 +77,52 @@ def install(core) -> None:
                         if not isinstance(csrf, str) or len(csrf) < 32:
                             csrf = secrets.token_urlsafe(32)
                             request.session["verification_captcha_csrf"] = csrf
-                        action = "/verify/captcha"
-                        body = f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>DinoBot · CAPTCHA</title><style>:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:#070b14;color:#f7f9fc;font:15px Inter,Pretendard,system-ui}}main{{width:min(440px,calc(100% - 28px));margin:12vh auto;background:#101827;border:1px solid #26344d;border-radius:20px;padding:28px}}.muted{{color:#94a3b8;line-height:1.65}}.code{{font-size:32px;font-weight:900;letter-spacing:.22em;text-align:center;padding:18px;margin:22px 0;background:#0a1220;border:1px dashed #40516f;border-radius:14px}}input{{width:100%;padding:13px;border-radius:10px;border:1px solid #33435f;background:#09111e;color:#fff;font-size:18px;text-align:center;letter-spacing:.12em}}button{{width:100%;margin-top:14px;padding:13px;border:0;border-radius:10px;background:#6572ff;color:#fff;font-weight:800;cursor:pointer}}</style></head><body><main><h1>🛡️ 보안 확인</h1><p class='muted'>이 서버는 인증 전에 CAPTCHA 확인을 사용합니다. 아래 숫자를 입력하면 Discord 인증을 계속할 수 있습니다.</p><div class='code'>{html.escape(challenge)}</div><form method='post' action='{action}'><input type='hidden' name='guild_id' value='{guild_id}'><input type='hidden' name='csrf' value='{html.escape(csrf, quote=True)}'><input name='answer' inputmode='numeric' autocomplete='off' maxlength='6' required placeholder='6자리 입력'><button type='submit'>CAPTCHA 확인 후 인증 계속</button></form></main></body></html>"""
+                        body = f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>DinoBot · CAPTCHA</title><style>:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:#070b14;color:#f7f9fc;font:15px Inter,Pretendard,system-ui}}main{{width:min(440px,calc(100% - 28px));margin:12vh auto;background:#101827;border:1px solid #26344d;border-radius:20px;padding:28px}}.muted{{color:#94a3b8;line-height:1.65}}.code{{font-size:32px;font-weight:900;letter-spacing:.22em;text-align:center;padding:18px;margin:22px 0;background:#0a1220;border:1px dashed #40516f;border-radius:14px}}input{{width:100%;padding:13px;border-radius:10px;border:1px solid #33435f;background:#09111e;color:#fff;font-size:18px;text-align:center;letter-spacing:.12em}}button{{width:100%;margin-top:14px;padding:13px;border:0;border-radius:10px;background:#6572ff;color:#fff;font-weight:800;cursor:pointer}}</style></head><body><main><h1>🛡️ 보안 확인</h1><p class='muted'>이 서버는 인증 전에 CAPTCHA 확인을 사용합니다. 아래 숫자를 입력하면 Discord 인증을 계속할 수 있습니다.</p><div class='code'>{html.escape(challenge)}</div><form method='post' action='/verify/captcha'><input type='hidden' name='guild_id' value='{guild_id}'><input type='hidden' name='csrf' value='{html.escape(csrf, quote=True)}'><input name='answer' inputmode='numeric' autocomplete='off' maxlength='6' required placeholder='6자리 입력'><button type='submit'>CAPTCHA 확인 후 인증 계속</button></form></main></body></html>"""
                         return HTMLResponse(body, status_code=200)
 
                     response = await call_next(request)
 
-                    if ip_enabled and request.query_params.get("code"):
+                    if request.query_params.get("code"):
                         user_id = int(request.session.get("user_id") or 0)
                         forwarded = request.headers.get("x-forwarded-for", "")
                         ip = forwarded.split(",", 1)[0].strip() if forwarded else (request.client.host if request.client else "")
-                        # Store only the address; never put it in normal Discord
-                        # notifications. The server owner controls whether this
-                        # audit is enabled through /인증설정.
-                        try:
-                            await DB.execute(
-                                "INSERT INTO verification_logs (guild_id,user_id,event,captcha_passed,ip_address,created_at) VALUES (%s,%s,%s,%s,%s,NOW()::text)",
-                                guild_id,
-                                user_id,
-                                "verification_completed",
-                                1 if captcha_enabled else 0,
-                                ip[:128] if ip else None,
-                            )
-                        except Exception:
-                            log.exception("verification IP audit write failed guild=%s", guild_id)
+                        captcha_passed = 1 if captcha_enabled else 0
+
+                        # Database audit is controlled by the IP collection switch.
+                        if ip_enabled:
+                            try:
+                                await DB.execute(
+                                    "INSERT INTO verification_logs (guild_id,user_id,event,captcha_passed,ip_address,created_at) VALUES (%s,%s,%s,%s,%s,NOW()::text)",
+                                    guild_id,
+                                    user_id,
+                                    "verification_completed",
+                                    captcha_passed,
+                                    ip[:128] if ip else None,
+                                )
+                            except Exception:
+                                log.exception("verification IP audit write failed guild=%s", guild_id)
+
+                        # Discord completion log is controlled by the selected log
+                        # channel. The IP is included only when IP collection is on.
+                        if log_channel_id:
+                            try:
+                                guild = bot.get_guild(guild_id)
+                                channel = guild.get_channel(log_channel_id) if guild else None
+                                if isinstance(channel, discord.TextChannel):
+                                    embed = discord.Embed(
+                                        title="✅ Discord 인증 완료",
+                                        color=discord.Color.green(),
+                                        timestamp=discord.utils.utcnow(),
+                                    )
+                                    embed.add_field(name="사용자", value=f"<@{user_id}>" if user_id else "확인 불가", inline=True)
+                                    embed.add_field(name="CAPTCHA", value="통과" if captcha_enabled else "사용 안 함", inline=True)
+                                    embed.add_field(name="IP", value=ip if ip_enabled and ip else "수집 안 함", inline=False)
+                                    embed.set_footer(text="DinoBot 인증 로그")
+                                    await channel.send(embed=embed)
+                            except (discord.Forbidden, discord.HTTPException):
+                                log.warning("verification completion log send failed guild=%s channel=%s", guild_id, log_channel_id)
+                            except Exception:
+                                log.exception("verification completion log unexpected failure guild=%s", guild_id)
                     return response
             except Exception:
                 log.exception("verification runtime policy failed; preserving callback")
