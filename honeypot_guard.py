@@ -52,8 +52,7 @@ def install(core):
             if not channel:
                 continue
             try:
-                raw = json.loads(row["overwrites"])
-                for target_id, allow, deny in raw:
+                for target_id, allow, deny in json.loads(row["overwrites"]):
                     target = interaction.guild.get_role(int(target_id))
                     if target:
                         overwrite = discord.PermissionOverwrite.from_pair(discord.Permissions(int(allow)), discord.Permissions(int(deny)))
@@ -75,26 +74,21 @@ def install(core):
     async def honeypot_restore(interaction: discord.Interaction):
         await restore(interaction)
 
-    @bot.event
-    async def on_message(message: discord.Message):
+    async def honeypot_listener(message: discord.Message):
         if message.author.bot or not message.guild or not isinstance(message.channel, discord.TextChannel):
             return
         try:
             row = await DB.fetchone("SELECT channel_id,enabled,triggered FROM honeypot_settings WHERE guild_id=%s", message.guild.id)
             if not row or not int(row.get("enabled") or 0) or int(row.get("triggered") or 0) or int(row.get("channel_id") or 0) != message.channel.id:
-                await bot.process_commands(message)
                 return
             if isinstance(message.author, discord.Member) and (message.author.guild_permissions.administrator or await core.is_bot_admin(message.author, message.guild.id)):
-                await bot.process_commands(message)
                 return
 
             await _ensure(DB)
             await DB.execute("UPDATE honeypot_settings SET triggered=1,triggered_at=%s WHERE guild_id=%s", datetime.now(timezone.utc).isoformat(), message.guild.id)
             everyone = message.guild.default_role
             for channel in message.guild.channels:
-                if not isinstance(channel, (discord.TextChannel, discord.ForumChannel, discord.VoiceChannel)):
-                    continue
-                if channel.id == message.channel.id:
+                if not isinstance(channel, (discord.TextChannel, discord.ForumChannel, discord.VoiceChannel)) or channel.id == message.channel.id:
                     continue
                 try:
                     existing = channel.overwrites_for(everyone)
@@ -113,13 +107,13 @@ def install(core):
                 except (discord.Forbidden, discord.HTTPException):
                     ticket = None
             if ticket:
-                await ticket.send("🚨 **허니팟 격리 모드**\n일반 채널은 삭제하지 않고 잠시 잠갔습니다. 문제가 있으면 이 채널에서 이의제기를 접수하세요.\n관리자는 `/허니팟복구`로 원래 권한을 복구할 수 있습니다.")
+                await ticket.send("🚨 **허니팟 격리 모드**\n일반 채널은 삭제하지 않고 잠갔습니다. 문제가 있으면 이 채널에서 이의제기를 접수하세요.\n관리자는 `/허니팟복구`로 원래 권한을 복구할 수 있습니다.")
             try:
                 await message.delete()
             except discord.HTTPException:
                 pass
         except Exception:
             log.exception("honeypot handler failed guild=%s", message.guild.id)
-        await bot.process_commands(message)
 
+    bot.add_listener(honeypot_listener, "on_message")
     log.info("Reversible honeypot quarantine guard installed")
