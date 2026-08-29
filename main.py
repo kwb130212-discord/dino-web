@@ -1,45 +1,29 @@
 # -*- coding: utf-8 -*-
 """DinoBot production entrypoint."""
 import os
-
-PRIMARY_BASE_URL = os.getenv("DINO_PUBLIC_BASE_URL", "https://dinobotservice.64bit.kr").strip().rstrip("/")
-if not PRIMARY_BASE_URL.startswith(("http://", "https://")):
-    PRIMARY_BASE_URL = "https://" + PRIMARY_BASE_URL
-PRODUCTION_BASE_URL = PRIMARY_BASE_URL
-os.environ["DINO_PRIMARY_BASE_URL"] = PRIMARY_BASE_URL
-os.environ["DINO_FALLBACK_BASE_URL"] = PRIMARY_BASE_URL
-os.environ["DINO_PUBLIC_BASE_URL"] = PRODUCTION_BASE_URL
-CANONICAL_REDIRECT_URI = f"{PRODUCTION_BASE_URL}/dashboard/callback"
-os.environ["REDIRECT_URI"] = CANONICAL_REDIRECT_URI
-os.environ["DASHBOARD_REDIRECT_URI"] = CANONICAL_REDIRECT_URI
-os.environ["DISCORD_REDIRECT_URI"] = CANONICAL_REDIRECT_URI
-os.environ["VERIFY_REDIRECT_URI"] = CANONICAL_REDIRECT_URI
-os.environ["TRIAL_REDIRECT_URI"] = os.getenv("TRIAL_REDIRECT_URI", f"{PRODUCTION_BASE_URL}/trial/callback").strip().rstrip("/")
-
+PRIMARY_BASE_URL=os.getenv("DINO_PUBLIC_BASE_URL","https://dinobotservice.64bit.kr").strip().rstrip("/")
+if not PRIMARY_BASE_URL.startswith(("http://","https://")): PRIMARY_BASE_URL="https://"+PRIMARY_BASE_URL
+PRODUCTION_BASE_URL=PRIMARY_BASE_URL
+os.environ["DINO_PRIMARY_BASE_URL"]=PRIMARY_BASE_URL; os.environ["DINO_FALLBACK_BASE_URL"]=PRIMARY_BASE_URL; os.environ["DINO_PUBLIC_BASE_URL"]=PRODUCTION_BASE_URL
+CANONICAL_REDIRECT_URI=f"{PRODUCTION_BASE_URL}/dashboard/callback"
+os.environ["REDIRECT_URI"]=CANONICAL_REDIRECT_URI; os.environ["DASHBOARD_REDIRECT_URI"]=CANONICAL_REDIRECT_URI; os.environ["DISCORD_REDIRECT_URI"]=CANONICAL_REDIRECT_URI; os.environ["VERIFY_REDIRECT_URI"]=CANONICAL_REDIRECT_URI
+os.environ["TRIAL_REDIRECT_URI"]=os.getenv("TRIAL_REDIRECT_URI",f"{PRODUCTION_BASE_URL}/trial/callback").strip().rstrip("/")
 import uvicorn
 import core
-
-core.TIER_LABEL = {"bronze": "브론즈", "silver": "실버", "gold": "골드", "platinum": "플래티넘"}
-core.TIER_ORDER = {"bronze": 1, "silver": 2, "gold": 3, "platinum": 4}
-
-_bot_tree = core.bot.tree
-_original_add_command = _bot_tree.add_command
-
-def _safe_add_command(command, *args, **kwargs):
-    existing = _bot_tree.get_command(command.name)
-    if existing is not None and existing is not command:
-        _bot_tree.remove_command(command.name)
-        core.logger.warning("Duplicate slash command replaced safely: /%s", command.name)
-    return _original_add_command(command, *args, **kwargs)
-
-_bot_tree.add_command = _safe_add_command
-
+core.TIER_LABEL={"bronze":"브론즈","silver":"실버","gold":"골드","platinum":"플래티넘"}; core.TIER_ORDER={"bronze":1,"silver":2,"gold":3,"platinum":4}
+_bot_tree=core.bot.tree; _original_add_command=_bot_tree.add_command
+def _safe_add_command(command,*args,**kwargs):
+    existing=_bot_tree.get_command(command.name)
+    if existing is not None and existing is not command: _bot_tree.remove_command(command.name); core.logger.warning("Duplicate slash command replaced safely: /%s",command.name)
+    return _original_add_command(command,*args,**kwargs)
+_bot_tree.add_command=_safe_add_command
 from startup_fixes import install as install_startup_fixes
 from security_hardening import install as install_security_hardening
 from web_entry import install as install_web_entry
 from dashboard_auth import install as install_dashboard_auth
 from oauth_state_runtime_fix import install as install_oauth_state_runtime_fix
 from verification_audit_runtime import install as install_verification_audit
+from honeypot_guard import install as install_honeypot_guard
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
@@ -60,40 +44,6 @@ from verification_controls import install as install_verification_controls
 from recovery_key_runtime_fix import install as install_recovery_key_runtime_fix
 from command_sync import install as install_command_sync
 from operator_recovery_keys import install as install_operator_recovery_keys
-
-# Legacy duplicate installers deliberately remain in the repository for
-# compatibility but are not installed: auth_settings, dashboard_servers_v2,
-# and dashboard_v4. Canonical implementations are dashboard_v5 and the unified
-# verification control center.
-install_startup_fixes(core)
-install_security_hardening(core)
-install_web_entry(core)
-install_dashboard_auth(core)
-install_oauth_state_runtime_fix(core)
-install_verification_audit(core)
-install_control_center(core)
-install_tutorial_logs(core)
-install_ticket_control(core)
-install_persistent_settings(core)
-install_dashboard_shortcuts(core)
-install_webboard_features(core)
-install_dashboard_device(core)
-install_dashboard_v5(core)
-install_ip_analyzer(core)
-install_verification_features(core)
-install_unified_control(core)
-install_license_manager(core)
-install_license_lifecycle(core)
-install_discord_dashboard_controls(core)
-install_support_vending_referrals(core)
-install_bot_admin_guards(core)
-install_verification_controls(core)
-install_recovery_key_runtime_fix(core)
-install_command_sync(core)
-install_operator_recovery_keys(core)
-
-app = core.app
-bot = core.bot
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), proxy_headers=True, forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"))
+install_startup_fixes(core); install_security_hardening(core); install_web_entry(core); install_dashboard_auth(core); install_oauth_state_runtime_fix(core); install_verification_audit(core); install_honeypot_guard(core); install_control_center(core); install_tutorial_logs(core); install_ticket_control(core); install_persistent_settings(core); install_dashboard_shortcuts(core); install_webboard_features(core); install_dashboard_device(core); install_dashboard_v5(core); install_ip_analyzer(core); install_verification_features(core); install_unified_control(core); install_license_manager(core); install_license_lifecycle(core); install_discord_dashboard_controls(core); install_support_vending_referrals(core); install_bot_admin_guards(core); install_verification_controls(core); install_recovery_key_runtime_fix(core); install_command_sync(core); install_operator_recovery_keys(core)
+app=core.app; bot=core.bot
+if __name__=="__main__": uvicorn.run(app,host="0.0.0.0",port=int(os.getenv("PORT",8000)),proxy_headers=True,forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS","*"))
