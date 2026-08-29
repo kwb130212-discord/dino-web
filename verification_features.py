@@ -52,10 +52,6 @@ def _oauth_url(guild_id: Optional[int]) -> str:
         "scope": "identify guilds.join",
         "prompt": "consent",
     }
-    # New panels always carry a signed guild-bound state. The optional None
-    # path exists only for legacy persistent views created before guild_id was
-    # introduced; it prevents a stale panel from crashing the whole bot during
-    # startup. New verification panels never use this compatibility path.
     if guild_id is not None:
         params["state"] = _make_verify_state(guild_id)
     return "https://discord.com/oauth2/authorize?" + urlencode(params)
@@ -77,24 +73,34 @@ class VerificationView(discord.ui.View):
 
 
 class VerificationPanelModal(discord.ui.Modal, title="인증패널 전송"):
+    """Single canonical modal used by both /인증패널전송 and /인증패널생성."""
+
     button_text = discord.ui.TextInput(
         label="버튼 TEXT",
         placeholder="예: 인증하기",
         default="인증하기",
         max_length=80,
+        required=True,
+    )
+    top_text = discord.ui.TextInput(
+        label="사진 위 글자 (선택)",
+        placeholder="사진 위에 표시할 문구",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=2000,
     )
     image_url = discord.ui.TextInput(
         label="사진 URL (선택)",
-        placeholder="https://...",
+        placeholder="https://example.com/image.png",
         required=False,
         max_length=1000,
     )
-    body_text = discord.ui.TextInput(
-        label="쓸 글자",
-        placeholder="인증 안내 문구를 입력하세요.",
+    bottom_text = discord.ui.TextInput(
+        label="사진 아래 글자 (선택)",
+        placeholder="사진 아래에 표시할 문구",
         style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=4000,
+        required=False,
+        max_length=2000,
     )
 
     def __init__(self, core):
@@ -102,20 +108,32 @@ class VerificationPanelModal(discord.ui.Modal, title="인증패널 전송"):
         self.core = core
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
         if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
-            return await interaction.followup.send("❌ 서버의 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
-        if not interaction.user.guild_permissions.manage_guild:
-            return await interaction.followup.send("❌ 서버 관리 권한이 필요합니다.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ 서버의 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True
+            )
+        if not isinstance(interaction.user, discord.Member) or not await self.core.is_server_admin(
+            interaction.user, interaction.guild.id
+        ):
+            return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
 
         button_text = str(self.button_text.value).strip() or "인증하기"
+        top_text = str(self.top_text.value).strip()
         image_url = str(self.image_url.value).strip()
-        body_text = str(self.body_text.value).strip()
+        bottom_text = str(self.bottom_text.value).strip()
         if image_url and not image_url.startswith(("https://", "http://")):
-            return await interaction.followup.send("❌ 사진 URL은 http:// 또는 https://로 시작해야 합니다.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ 사진 URL은 http:// 또는 https://로 시작해야 합니다.", ephemeral=True
+            )
+
+        # Acknowledge the modal immediately. Discord invalidates an interaction
+        # if the first response takes too long while DB/API work is running.
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
-            await self.core.DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_image_url TEXT")
+            await self.core.DB.execute(
+                "ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_image_url TEXT"
+            )
             await self.core.DB.execute(
                 """INSERT INTO guild_settings
                    (guild_id, verify_button_text, verify_description, verify_image_url)
@@ -124,22 +142,49 @@ class VerificationPanelModal(discord.ui.Modal, title="인증패널 전송"):
                      verify_button_text=EXCLUDED.verify_button_text,
                      verify_description=EXCLUDED.verify_description,
                      verify_image_url=EXCLUDED.verify_image_url""",
-                interaction.guild.id, button_text, body_text, image_url or None,
+                interaction.guild.id,
+                button_text,
+                (top_text + "\n\n" + bottom_text).strip(),
+                image_url or None,
             )
-        except Exception:
-            log.exception("verification panel settings save failed")
-            return await interaction.followup.send("❌ 인증패널 설정 저장에 실패했습니다.", ephemeral=True)
 
-        try:
-            embed = discord.Embed(description=body_text, color=discord.Color.blurple())
+            # Deterministic order: optional text above, image, optional text below + button.
+            if top_text:
+                await interaction.channel.send(top_text)
+
             if image_url:
-                embed.set_image(url=image_url)
-            await interaction.channel.send(embed=embed, view=VerificationView(interaction.guild.id, button_text))
-        except (discord.HTTPException, RuntimeError):
-            log.exception("verification panel send failed")
-            return await interaction.followup.send("❌ 인증패널 전송에 실패했습니다. URL 또는 봇 권한을 확인해주세요.", ephemeral=True)
+                image_embed = discord.Embed(color=discord.Color.blurple())
+                image_embed.set_image(url=image_url)
+                await interaction.channel.send(embed=image_embed)
 
-        await interaction.followup.send("✅ 인증패널을 전송했습니다.\n순서: 글자 → 사진(선택) → 버튼", ephemeral=True)
+            view = VerificationView(interaction.guild.id, button_text)
+            if bottom_text:
+                await interaction.channel.send(bottom_text, view=view)
+            else:
+                await interaction.channel.send("인증이 필요하면 아래 버튼을 눌러주세요.", view=view)
+
+        except (discord.HTTPException, discord.Forbidden, RuntimeError, ValueError) as exc:
+            log.exception("verification panel send failed: %s", exc)
+            try:
+                await interaction.followup.send(
+                    "❌ 인증패널 전송에 실패했습니다. 봇의 메시지 권한, 사진 URL, OAuth 설정을 확인해주세요.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                log.exception("failed to send verification panel error followup")
+            return
+        except Exception as exc:
+            log.exception("verification panel unexpected failure: %s", exc)
+            try:
+                await interaction.followup.send("❌ 인증패널 생성 중 오류가 발생했습니다.", ephemeral=True)
+            except discord.HTTPException:
+                log.exception("failed to send verification panel unexpected-error followup")
+            return
+
+        await interaction.followup.send(
+            "✅ 인증패널을 전송했습니다.\n순서: 사진 위 글자(선택) → 사진(선택) → 사진 아래 글자(선택) → 버튼",
+            ephemeral=True,
+        )
 
 
 async def _assign_verify_role(core, guild_id: int, user_id: int) -> tuple[bool, str]:
@@ -199,19 +244,30 @@ def install(core) -> None:
         )
         await interaction.response.send_message(f"✅ 인증 역할을 {역할.mention}으로 설정했습니다.", ephemeral=True)
 
-    @bot.tree.command(name="인증패널전송", description="글자·사진·버튼을 설정해 인증패널을 전송합니다.")
+    async def _send_panel_command(interaction: discord.Interaction):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        if not await core.is_server_admin(interaction.user, interaction.guild.id):
+            return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
+        await interaction.response.send_modal(VerificationPanelModal(core))
+
+    @app_commands.command(name="인증패널전송", description="글자·사진·버튼을 설정해 인증패널을 전송합니다.")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def send_panel(interaction: discord.Interaction):
-        if interaction.guild is None or not interaction.user.guild_permissions.manage_guild:
-            return await interaction.response.send_message("❌ 서버 관리 권한이 필요합니다.", ephemeral=True)
-        await interaction.response.send_modal(VerificationPanelModal(core))
+        await _send_panel_command(interaction)
 
-    @bot.tree.command(name="인증설정상태", description="현재 인증패널 설정을 확인합니다.")
+    @app_commands.command(name="인증패널생성", description="글자·사진·버튼을 설정해 인증패널을 생성합니다.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def create_panel(interaction: discord.Interaction):
+        await _send_panel_command(interaction)
+
+    @app_commands.command(name="인증설정상태", description="현재 인증패널 설정을 확인합니다.")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def panel_status(interaction: discord.Interaction):
-        if interaction.guild is None or not interaction.user.guild_permissions.manage_guild:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("❌ 서버 관리 권한이 필요합니다.", ephemeral=True)
         await DB.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS verify_image_url TEXT")
         row = await DB.fetchone(
@@ -225,5 +281,8 @@ def install(core) -> None:
         embed.add_field(name="인증 역할", value=f"<@&{row.get('verify_role_id')}>" if row.get("verify_role_id") else "미설정", inline=False)
         embed.add_field(name="OAuth2 콜백", value=CANONICAL_CALLBACK, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    for command in (send_panel, create_panel, panel_status):
+        bot.tree.add_command(command)
 
     log.info("Verification subsystem installed with canonical OAuth2 callback %s", CANONICAL_CALLBACK)
