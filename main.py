@@ -22,8 +22,6 @@ import core
 core.TIER_LABEL = {"bronze": "브론즈", "silver": "실버", "gold": "골드", "platinum": "플래티넘"}
 core.TIER_ORDER = {"bronze": 1, "silver": 2, "gold": 3, "platinum": 4}
 
-# One command registry. Every installer goes through this replacement policy so
-# a legacy module cannot leave a second /같은명령어 entry behind.
 _bot_tree = core.bot.tree
 _original_add_command = _bot_tree.add_command
 
@@ -40,6 +38,7 @@ from startup_fixes import install as install_startup_fixes
 from security_hardening import install as install_security_hardening
 from web_entry import install as install_web_entry
 from dashboard_auth import install as install_dashboard_auth
+from oauth_state_runtime_fix import install as install_oauth_state_runtime_fix
 from control_center import install as install_control_center
 from tutorial_logs import install as install_tutorial_logs
 from ticket_control import install as install_ticket_control
@@ -61,15 +60,15 @@ from recovery_key_runtime_fix import install as install_recovery_key_runtime_fix
 from command_sync import install as install_command_sync
 from operator_recovery_keys import install as install_operator_recovery_keys
 
-# Intentionally disabled legacy installers:
-# - auth_settings: duplicated /인증설정 and /dashboard/server/{id}/auth routes
-# - dashboard_servers_v2: duplicated /dashboard route
-# - dashboard_v4: duplicated dashboard server routes
-# The canonical implementations are dashboard_v5 + verification_controls.
+# Legacy duplicate installers deliberately remain in the repository for
+# compatibility but are not installed: auth_settings, dashboard_servers_v2,
+# and dashboard_v4. Canonical implementations are dashboard_v5 and the unified
+# verification control center.
 install_startup_fixes(core)
 install_security_hardening(core)
 install_web_entry(core)
 install_dashboard_auth(core)
+install_oauth_state_runtime_fix(core)
 install_control_center(core)
 install_tutorial_logs(core)
 install_ticket_control(core)
