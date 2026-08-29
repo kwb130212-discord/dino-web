@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Canonical verification helpers.
-
-All administrator-facing verification configuration is intentionally owned by
-verification_controls.py. This module contains only the reusable OAuth button
-view and role-assignment helper, so it cannot register duplicate commands.
-"""
+"""Canonical verification helpers and interactive CAPTCHA gate."""
 from __future__ import annotations
 
 import base64
@@ -13,6 +8,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import time
 from typing import Optional
 from urllib.parse import urlencode
@@ -60,19 +56,68 @@ def _oauth_url(guild_id: Optional[int]) -> str:
     return "https://discord.com/oauth2/authorize?" + urlencode(params)
 
 
+class CaptchaModal(discord.ui.Modal, title="DinoBot CAPTCHA"):
+    answer = discord.ui.TextInput(label="계산 결과를 입력하세요", placeholder="예: 17", max_length=8, required=True)
+
+    def __init__(self, guild_id: int, button_label: str):
+        super().__init__()
+        self.guild_id = guild_id
+        self.button_label = button_label
+        self.a = random.randint(2, 18)
+        self.b = random.randint(2, 18)
+        self.op = random.choice(("+", "-", "×"))
+        self.expected = self.a + self.b if self.op == "+" else self.a - self.b if self.op == "-" else self.a * self.b
+        self.answer.label = f"{self.a} {self.op} {self.b} = ?"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            supplied = int(str(self.answer.value).strip())
+        except ValueError:
+            supplied = None
+        if supplied != self.expected:
+            try:
+                await interaction.response.send_message("❌ CAPTCHA가 틀렸습니다. 인증 버튼을 다시 눌러주세요.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
+        url = _oauth_url(self.guild_id)
+        view = discord.ui.View(timeout=120)
+        view.add_item(discord.ui.Button(label=self.button_label[:80], style=discord.ButtonStyle.link, url=url))
+        await interaction.response.send_message("✅ CAPTCHA 통과. 아래 버튼으로 Discord 인증을 계속하세요.", view=view, ephemeral=True)
+
+
+class VerificationGateButton(discord.ui.Button):
+    def __init__(self, guild_id: int, button_label: str):
+        self.guild_id = guild_id
+        self.button_label = button_label
+        super().__init__(label=(button_label or "인증하기")[:80], style=discord.ButtonStyle.primary, custom_id=f"dinobot:verify:{guild_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            row = await interaction.client.core.DB.fetchone(
+                "SELECT verification_captcha_enabled FROM guild_settings WHERE guild_id=%s", self.guild_id
+            ) if hasattr(interaction.client, "core") else None
+        except Exception:
+            row = None
+        captcha_enabled = bool(int((row or {}).get("verification_captcha_enabled") or 0))
+        if captcha_enabled:
+            return await interaction.response.send_modal(CaptchaModal(self.guild_id, self.button_label))
+        url = _oauth_url(self.guild_id)
+        view = discord.ui.View(timeout=120)
+        view.add_item(discord.ui.Button(label=self.button_label[:80], style=discord.ButtonStyle.link, url=url))
+        await interaction.response.send_message("아래 버튼을 눌러 Discord 인증을 진행하세요.", view=view, ephemeral=True)
+
+
 class VerificationView(discord.ui.View):
-    """Persistent OAuth verification button."""
+    """Persistent verification panel. CAPTCHA is checked at click time."""
 
     def __init__(self, guild_id: Optional[int] = None, button_label: str = "인증하기"):
         super().__init__(timeout=None)
         self.guild_id = guild_id
-        self.add_item(
-            discord.ui.Button(
-                label=(button_label or "인증하기")[:80],
-                style=discord.ButtonStyle.link,
-                url=_oauth_url(guild_id),
-            )
-        )
+        if guild_id is not None:
+            self.add_item(VerificationGateButton(guild_id, button_label))
+        else:
+            self.add_item(discord.ui.Button(label=(button_label or "인증하기")[:80], style=discord.ButtonStyle.link, url=_oauth_url(None)))
 
 
 async def _assign_verify_role(core, guild_id: int, user_id: int) -> tuple[bool, str]:
@@ -108,5 +153,7 @@ async def _assign_verify_role(core, guild_id: int, user_id: int) -> tuple[bool, 
 
 def install(core) -> None:
     core.VerifyView = VerificationView
+    # Button callbacks need access to the canonical core instance.
+    core.bot.core = core
     core.assign_verify_role = lambda guild_id, user_id: _assign_verify_role(core, guild_id, user_id)
-    core.logger.info("Verification helpers installed; command registration delegated to /인증설정")
+    core.logger.info("Verification helpers installed: unified panel + optional CAPTCHA gate")
