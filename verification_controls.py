@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """Interactive in-Discord verification settings panel.
 
-Changes stay local until the administrator presses ``저장 및 실행``.  This
-makes the Discord control panel behave like a real settings editor instead of
-writing every click immediately.
+Changes stay local until the administrator presses ``저장 및 실행``. This
+module is also the runtime bridge for the CAPTCHA/IP audit policy so the
+Discord editor controls the actual verification flow.
 """
 from __future__ import annotations
 
+import html
+import secrets
+
 import discord
 from discord import app_commands
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 
 async def _ensure_columns(DB) -> None:
@@ -20,6 +24,7 @@ async def _ensure_columns(DB) -> None:
 
 def install(core) -> None:
     bot, DB, log = core.bot, core.DB, core.logger
+    app = core.app
 
     async def get_state(guild_id: int):
         await _ensure_columns(DB)
@@ -45,6 +50,90 @@ def install(core) -> None:
 
     def is_admin(interaction: discord.Interaction) -> bool:
         return bool(interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator)
+
+    # Runtime policy bridge.  It deliberately sits in front of the existing
+    # OAuth callback, so enabling CAPTCHA does not require changing Discord's
+    # OAuth redirect URI and enabling IP collection does not expose the address
+    # in Discord messages.
+    @app.middleware("http")
+    async def verification_runtime_policy(request, call_next):
+        if request.url.path == "/dashboard/callback":
+            try:
+                from dashboard_auth import _decode_state
+                state = request.query_params.get("state", "")
+                payload = _decode_state(state) if state else None
+                if payload and payload.get("purpose") == "verification" and str(payload.get("guild_id", "")).isdigit():
+                    guild_id = int(payload["guild_id"])
+                    row = await DB.fetchone(
+                        "SELECT verification_captcha_enabled, verification_ip_collection_enabled FROM guild_settings WHERE guild_id=%s",
+                        guild_id,
+                    ) or {}
+                    captcha_enabled = bool(int(row.get("verification_captcha_enabled") or 0))
+                    ip_enabled = bool(int(row.get("verification_ip_collection_enabled") or 0))
+
+                    # CAPTCHA is checked before the callback consumes Discord's
+                    # one-time OAuth code. A failed/first attempt therefore can
+                    # safely be restarted without an invalid code race.
+                    if captcha_enabled and request.query_params.get("code") and not request.session.get(f"verification_captcha_ok:{guild_id}"):
+                        challenge = request.session.get(f"verification_captcha_challenge:{guild_id}")
+                        if not challenge:
+                            challenge = str(secrets.randbelow(900000) + 100000)
+                            request.session[f"verification_captcha_challenge:{guild_id}"] = challenge
+                        csrf = request.session.get("verification_captcha_csrf")
+                        if not isinstance(csrf, str) or len(csrf) < 32:
+                            csrf = secrets.token_urlsafe(32)
+                            request.session["verification_captcha_csrf"] = csrf
+                        action = "/verify/captcha"
+                        body = f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>DinoBot · CAPTCHA</title><style>:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:#070b14;color:#f7f9fc;font:15px Inter,Pretendard,system-ui}}main{{width:min(440px,calc(100% - 28px));margin:12vh auto;background:#101827;border:1px solid #26344d;border-radius:20px;padding:28px}}.muted{{color:#94a3b8;line-height:1.65}}.code{{font-size:32px;font-weight:900;letter-spacing:.22em;text-align:center;padding:18px;margin:22px 0;background:#0a1220;border:1px dashed #40516f;border-radius:14px}}input{{width:100%;padding:13px;border-radius:10px;border:1px solid #33435f;background:#09111e;color:#fff;font-size:18px;text-align:center;letter-spacing:.12em}}button{{width:100%;margin-top:14px;padding:13px;border:0;border-radius:10px;background:#6572ff;color:#fff;font-weight:800;cursor:pointer}}</style></head><body><main><h1>🛡️ 보안 확인</h1><p class='muted'>이 서버는 인증 전에 CAPTCHA 확인을 사용합니다. 아래 숫자를 입력하면 Discord 인증을 계속할 수 있습니다.</p><div class='code'>{html.escape(challenge)}</div><form method='post' action='{action}'><input type='hidden' name='guild_id' value='{guild_id}'><input type='hidden' name='csrf' value='{html.escape(csrf, quote=True)}'><input name='answer' inputmode='numeric' autocomplete='off' maxlength='6' required placeholder='6자리 입력'><button type='submit'>CAPTCHA 확인 후 인증 계속</button></form></main></body></html>"""
+                        return HTMLResponse(body, status_code=200)
+
+                    response = await call_next(request)
+
+                    if ip_enabled and request.query_params.get("code"):
+                        user_id = int(request.session.get("user_id") or 0)
+                        forwarded = request.headers.get("x-forwarded-for", "")
+                        ip = forwarded.split(",", 1)[0].strip() if forwarded else (request.client.host if request.client else "")
+                        # Store only the address; never put it in normal Discord
+                        # notifications. The server owner controls whether this
+                        # audit is enabled through /인증설정.
+                        try:
+                            await DB.execute(
+                                "INSERT INTO verification_logs (guild_id,user_id,event,captcha_passed,ip_address,created_at) VALUES (%s,%s,%s,%s,%s,NOW()::text)",
+                                guild_id,
+                                user_id,
+                                "verification_completed",
+                                1 if captcha_enabled else 0,
+                                ip[:128] if ip else None,
+                            )
+                        except Exception:
+                            log.exception("verification IP audit write failed guild=%s", guild_id)
+                    return response
+            except Exception:
+                log.exception("verification runtime policy failed; preserving callback")
+        return await call_next(request)
+
+    @app.post("/verify/captcha")
+    async def verify_captcha(request):
+        form = await request.form()
+        raw_gid = str(form.get("guild_id", "")).strip()
+        answer = str(form.get("answer", "")).strip()
+        csrf = str(form.get("csrf", ""))
+        if not raw_gid.isdigit():
+            return HTMLResponse("잘못된 인증 요청입니다.", status_code=400)
+        guild_id = int(raw_gid)
+        expected_csrf = request.session.get("verification_captcha_csrf")
+        challenge = request.session.get(f"verification_captcha_challenge:{guild_id}")
+        if not isinstance(expected_csrf, str) or not secrets.compare_digest(expected_csrf, csrf or ""):
+            return HTMLResponse("CAPTCHA 세션이 만료되었습니다. 인증 버튼을 다시 눌러주세요.", status_code=403)
+        if not isinstance(challenge, str) or not secrets.compare_digest(challenge, answer):
+            return HTMLResponse("CAPTCHA가 일치하지 않습니다. 뒤로 돌아가 다시 시도해주세요.", status_code=400)
+        request.session[f"verification_captcha_ok:{guild_id}"] = True
+        request.session.pop(f"verification_captcha_challenge:{guild_id}", None)
+        try:
+            from verification_features import _oauth_url
+            return RedirectResponse(_oauth_url(guild_id), status_code=303)
+        except Exception:
+            return HTMLResponse("OAuth 설정을 확인할 수 없습니다.", status_code=500)
 
     class SettingsView(discord.ui.View):
         def __init__(self, guild_id: int, initial: dict):
@@ -185,14 +274,12 @@ def install(core) -> None:
         view = SettingsView(interaction.guild.id, initial)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
-    # discord.py 2.x exposes Command.callback as read-only. Construct a fresh
-    # command and remove any legacy /인증설정 registration before adding the
-    # canonical interactive command. This prevents the legacy read-only status
-    # command from appearing alongside this editor after global synchronization.
+    # discord.py 2.x exposes Command.callback as read-only. Remove every
+    # legacy registration and install exactly one canonical interactive command.
     try:
         bot.tree.remove_command("인증설정", type=discord.AppCommandType.chat_input)
     except (KeyError, ValueError, TypeError):
         pass
     command = app_commands.Command(name="인증설정", description="CAPTCHA, IP 수집, 인증 로그 채널, 인증 역할을 한 번에 설정합니다.", callback=settings_command)
     bot.tree.add_command(command)
-    log.info("Interactive /인증설정 controls installed (canonical single command, save-and-run)")
+    log.info("Interactive /인증설정 controls installed (canonical single command, save-and-run, runtime policy enabled)")
