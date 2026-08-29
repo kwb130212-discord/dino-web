@@ -34,6 +34,7 @@ from dashboard_device_v3 import install as install_dashboard_device
 from dashboard_v5 import install as install_dashboard_v5
 from ip_analyzer import install as install_ip_analyzer
 from verification_features import install as install_verification_features
+from web_captcha import install as install_web_captcha
 from unified_control import install as install_unified_control
 from license_manager import install as install_license_manager
 from license_lifecycle import install as install_license_lifecycle
@@ -45,6 +46,6 @@ from recovery_key_runtime_fix import install as install_recovery_key_runtime_fix
 from command_sync import install as install_command_sync
 from operator_recovery_keys import install as install_operator_recovery_keys
 from verification_panel_v2 import install as install_verification_panel_v2
-install_startup_fixes(core); install_security_hardening(core); install_web_entry(core); install_dashboard_auth(core); install_oauth_state_runtime_fix(core); install_verification_audit(core); install_honeypot_guard(core); install_control_center(core); install_tutorial_logs(core); install_ticket_control(core); install_persistent_settings(core); install_dashboard_shortcuts(core); install_webboard_features(core); install_dashboard_device(core); install_dashboard_v5(core); install_ip_analyzer(core); install_verification_features(core); install_unified_control(core); install_license_manager(core); install_license_lifecycle(core); install_discord_dashboard_controls(core); install_support_vending_referrals(core); install_bot_admin_guards(core); install_verification_controls(core); install_recovery_key_runtime_fix(core); install_command_sync(core); install_operator_recovery_keys(core); install_verification_panel_v2(core)
+install_startup_fixes(core); install_security_hardening(core); install_web_entry(core); install_dashboard_auth(core); install_oauth_state_runtime_fix(core); install_verification_audit(core); install_honeypot_guard(core); install_control_center(core); install_tutorial_logs(core); install_ticket_control(core); install_persistent_settings(core); install_dashboard_shortcuts(core); install_webboard_features(core); install_dashboard_device(core); install_dashboard_v5(core); install_ip_analyzer(core); install_verification_features(core); install_web_captcha(core); install_unified_control(core); install_license_manager(core); install_license_lifecycle(core); install_discord_dashboard_controls(core); install_support_vending_referrals(core); install_bot_admin_guards(core); install_verification_controls(core); install_recovery_key_runtime_fix(core); install_command_sync(core); install_operator_recovery_keys(core); install_verification_panel_v2(core)
 app=core.app; bot=core.bot
 if __name__=="__main__": uvicorn.run(app,host="0.0.0.0",port=int(os.getenv("PORT",8000)),proxy_headers=True,forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS","*"))
