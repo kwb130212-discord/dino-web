@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Single-source Discord verification control center.
 
-/인증설정 is the only administrator-facing verification command. Panel text,
-image, CAPTCHA, consented IP logging, verification logs, and role selection are
-edited in one view and applied together with ``저장 및 실행``.
+The public verification panel contains ONLY the administrator-configured
+text, image, and button. No DinoBot marketing, security, benefit, or server-
+verification boilerplate is injected into the public panel.
 """
 from __future__ import annotations
 
@@ -70,6 +70,23 @@ async def _save_state(DB, guild_id: int, values: dict) -> None:
     )
 
 
+def _public_panel_embed(panel) -> discord.Embed:
+    """Build the public panel with no hard-coded promotional copy."""
+    parts = []
+    if panel.top_text:
+        parts.append(panel.top_text)
+    if panel.bottom_text:
+        parts.append(panel.bottom_text)
+
+    embed = discord.Embed(
+        description="\n\n".join(parts) if parts else None,
+        color=discord.Color.blurple(),
+    )
+    if panel.image_url:
+        embed.set_image(url=panel.image_url)
+    return embed
+
+
 def install(core) -> None:
     bot, DB, log = core.bot, core.DB, core.logger
     if getattr(bot, "_dino_unified_verification_controls", False):
@@ -84,21 +101,47 @@ def install(core) -> None:
         )
 
     class PanelModal(discord.ui.Modal, title="인증패널 디자인"):
-        button_text = discord.ui.TextInput(label="인증 버튼 문구", default="인증하기", max_length=80, required=True)
-        top_text = discord.ui.TextInput(label="사진 위 글자 (선택)", style=discord.TextStyle.paragraph, max_length=2000, required=False)
-        image_url = discord.ui.TextInput(label="패널 사진 URL (선택)", placeholder="https://...", max_length=1000, required=False)
-        bottom_text = discord.ui.TextInput(label="사진 아래 글자 (선택)", style=discord.TextStyle.paragraph, max_length=2000, required=False)
+        button_text = discord.ui.TextInput(
+            label="인증 버튼 문구",
+            default="인증하기",
+            max_length=80,
+            required=True,
+        )
+        top_text = discord.ui.TextInput(
+            label="사진 위 글자 (선택)",
+            style=discord.TextStyle.paragraph,
+            max_length=2000,
+            required=False,
+        )
+        image_url = discord.ui.TextInput(
+            label="패널 사진 URL (선택)",
+            placeholder="https://...",
+            max_length=1000,
+            required=False,
+        )
+        bottom_text = discord.ui.TextInput(
+            label="사진 아래 글자 (선택)",
+            style=discord.TextStyle.paragraph,
+            max_length=2000,
+            required=False,
+        )
 
         def __init__(self, panel):
             super().__init__()
             self.panel = panel
+            self.button_text.default = panel.button_text or "인증하기"
+            self.top_text.default = panel.top_text or ""
+            self.image_url.default = panel.image_url or ""
+            self.bottom_text.default = panel.bottom_text or ""
 
         async def on_submit(self, interaction: discord.Interaction):
             if not is_admin(interaction):
                 return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
             image = str(self.image_url.value).strip()
             if image and not image.startswith(("https://", "http://")):
-                return await interaction.response.send_message("❌ 사진 URL은 http:// 또는 https://로 시작해야 합니다.", ephemeral=True)
+                return await interaction.response.send_message(
+                    "❌ 사진 URL은 http:// 또는 https://로 시작해야 합니다.", ephemeral=True
+                )
             self.panel.button_text = str(self.button_text.value).strip() or "인증하기"
             self.panel.top_text = str(self.top_text.value).strip()
             self.panel.image_url = image
@@ -108,7 +151,13 @@ def install(core) -> None:
     class CaptchaButton(discord.ui.Button):
         def __init__(self, panel):
             self.panel = panel
-            super().__init__(label="CAPTCHA: 사용" if panel.captcha else "CAPTCHA: 끔", emoji="🧩", style=discord.ButtonStyle.success if panel.captcha else discord.ButtonStyle.secondary, row=0)
+            super().__init__(
+                label="CAPTCHA: 사용" if panel.captcha else "CAPTCHA: 끔",
+                emoji="🧩",
+                style=discord.ButtonStyle.success if panel.captcha else discord.ButtonStyle.secondary,
+                row=0,
+            )
+
         async def callback(self, interaction):
             if not is_admin(interaction):
                 return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
@@ -118,7 +167,13 @@ def install(core) -> None:
     class IPButton(discord.ui.Button):
         def __init__(self, panel):
             self.panel = panel
-            super().__init__(label="접속 IP 로그: 사용" if panel.ip else "접속 IP 로그: 끔", emoji="🌐", style=discord.ButtonStyle.success if panel.ip else discord.ButtonStyle.secondary, row=0)
+            super().__init__(
+                label="접속 IP 로그: 사용" if panel.ip else "접속 IP 로그: 끔",
+                emoji="🌐",
+                style=discord.ButtonStyle.success if panel.ip else discord.ButtonStyle.secondary,
+                row=0,
+            )
+
         async def callback(self, interaction):
             if not is_admin(interaction):
                 return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
@@ -128,7 +183,14 @@ def install(core) -> None:
     class LogChannelSelect(discord.ui.ChannelSelect):
         def __init__(self, panel):
             self.panel = panel
-            super().__init__(placeholder="📋 인증 로그 채널 선택", channel_types=[discord.ChannelType.text], min_values=1, max_values=1, row=1)
+            super().__init__(
+                placeholder="📋 인증 로그 채널 선택",
+                channel_types=[discord.ChannelType.text],
+                min_values=1,
+                max_values=1,
+                row=1,
+            )
+
         async def callback(self, interaction):
             if not is_admin(interaction):
                 return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
@@ -139,13 +201,16 @@ def install(core) -> None:
         def __init__(self, panel):
             self.panel = panel
             super().__init__(placeholder="🎭 인증 완료 역할 선택", min_values=1, max_values=1, row=2)
+
         async def callback(self, interaction):
             if not is_admin(interaction):
                 return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
             role = self.values[0]
             me = interaction.guild.me if interaction.guild else None
             if role.is_default() or role.managed or (me and role >= me.top_role):
-                return await interaction.response.send_message("❌ 봇의 최고 역할보다 아래에 있는 일반 역할만 선택할 수 있습니다.", ephemeral=True)
+                return await interaction.response.send_message(
+                    "❌ 봇의 최고 역할보다 아래에 있는 일반 역할만 선택할 수 있습니다.", ephemeral=True
+                )
             self.panel.role_id = role.id
             await self.panel.redraw(interaction)
 
@@ -153,6 +218,7 @@ def install(core) -> None:
         def __init__(self, panel):
             self.panel = panel
             super().__init__(label="패널 디자인", emoji="🖼️", style=discord.ButtonStyle.secondary, row=3)
+
         async def callback(self, interaction):
             if not is_admin(interaction):
                 return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
@@ -162,6 +228,7 @@ def install(core) -> None:
         def __init__(self, panel):
             self.panel = panel
             super().__init__(label="저장 및 실행", emoji="💾", style=discord.ButtonStyle.primary, row=3)
+
         async def callback(self, interaction):
             if not is_admin(interaction):
                 return await interaction.response.send_message("❌ 서버 관리자 권한이 필요합니다.", ephemeral=True)
@@ -170,16 +237,18 @@ def install(core) -> None:
             try:
                 if guild is None:
                     raise RuntimeError("서버 정보를 확인할 수 없습니다.")
+
                 role = guild.get_role(self.panel.role_id) if self.panel.role_id else None
                 if role is not None:
                     me = guild.me
                     if role.is_default() or role.managed or (me and role >= me.top_role):
                         raise RuntimeError("인증 역할은 봇의 최고 역할보다 아래에 있어야 합니다.")
+
                 log_channel = guild.get_channel(self.panel.log_channel_id) if self.panel.log_channel_id else None
                 if self.panel.log_channel_id and not isinstance(log_channel, discord.TextChannel):
                     raise RuntimeError("인증 로그 채널을 찾을 수 없습니다.")
 
-                values = {
+                await _save_state(DB, guild.id, {
                     "captcha": self.panel.captcha,
                     "ip": self.panel.ip,
                     "log_channel_id": self.panel.log_channel_id,
@@ -188,30 +257,25 @@ def install(core) -> None:
                     "top_text": self.panel.top_text,
                     "image_url": self.panel.image_url,
                     "bottom_text": self.panel.bottom_text,
-                }
-                await _save_state(DB, guild.id, values)
+                })
 
-                # Save-and-run immediately publishes the configured panel. The
-                # panel is a single embed: optional text above, full-panel image,
-                # optional text below, then the OAuth button.
                 from verification_features import VerificationView
-                description_parts = []
-                if self.panel.top_text:
-                    description_parts.append(self.panel.top_text)
-                if self.panel.bottom_text:
-                    description_parts.append(self.panel.bottom_text)
-                embed = discord.Embed(
-                    title="🔐 서버 인증",
-                    description="\n\n".join(description_parts) or "인증이 필요하면 아래 버튼을 눌러주세요.",
-                    color=discord.Color.blurple(),
+                target = guild.get_channel(interaction.channel_id)
+                if not isinstance(target, discord.TextChannel):
+                    raise RuntimeError("현재 채널에 인증패널을 전송할 수 없습니다.")
+
+                # PUBLIC PANEL: only user text + user image + user button.
+                await target.send(
+                    embed=_public_panel_embed(self.panel),
+                    view=VerificationView(guild.id, self.panel.button_text),
                 )
-                if self.panel.image_url:
-                    embed.set_image(url=self.panel.image_url)
-                embed.set_footer(text="DinoBot · 인증 설정에 따라 CAPTCHA/로그가 적용됩니다.")
-                await guild.get_channel(interaction.channel_id).send(embed=embed, view=VerificationView(guild.id, self.panel.button_text))
 
                 if isinstance(log_channel, discord.TextChannel):
-                    log_embed = discord.Embed(title="🔐 인증 설정 적용", color=discord.Color.green(), timestamp=discord.utils.utcnow())
+                    log_embed = discord.Embed(
+                        title="🔐 인증 설정 적용",
+                        color=discord.Color.green(),
+                        timestamp=discord.utils.utcnow(),
+                    )
                     log_embed.add_field(name="CAPTCHA", value="사용" if self.panel.captcha else "사용 안 함", inline=True)
                     log_embed.add_field(name="접속 IP 로그", value="사용" if self.panel.ip else "사용 안 함", inline=True)
                     log_embed.add_field(name="인증 역할", value=role.mention if role else "미설정", inline=True)
@@ -222,13 +286,15 @@ def install(core) -> None:
                         log.exception("verification settings log send failed guild=%s", guild.id)
 
                 await interaction.edit_original_response(
-                    content="✅ **인증 설정 저장 + 실행 완료**\nCAPTCHA, 접속 IP 로그, 인증 로그, 역할, 인증패널이 현재 서버에 즉시 적용되었습니다.",
+                    content="✅ 인증패널이 저장되고 현재 채널에 전송되었습니다.",
                     embed=self.panel.embed(),
                     view=self.panel,
                 )
             except Exception as exc:
                 log.exception("verification settings apply failed guild=%s: %s", guild.id if guild else 0, exc)
-                await interaction.edit_original_response(content=f"❌ 적용 실패: {exc}", embed=self.panel.embed(), view=self.panel)
+                await interaction.edit_original_response(
+                    content=f"❌ 적용 실패: {exc}", embed=self.panel.embed(), view=self.panel
+                )
 
     class SettingsView(discord.ui.View):
         def __init__(self, guild_id: int, initial: dict):
@@ -255,16 +321,15 @@ def install(core) -> None:
 
         def embed(self):
             e = discord.Embed(title="🔐 DinoBot 통합 인증 설정", color=discord.Color.blurple())
-            e.description = "이 화면 하나에서 인증 관련 기능을 모두 설정합니다. 마지막에 **저장 및 실행**을 누르면 즉시 적용됩니다."
+            e.description = "인증 관련 설정을 선택한 뒤 저장 및 실행을 누르세요."
             e.add_field(name="🧩 CAPTCHA", value="🟢 사용" if self.captcha else "⚪ 사용 안 함", inline=True)
             e.add_field(name="🌐 접속 IP 로그", value="🟢 사용" if self.ip else "⚪ 사용 안 함", inline=True)
             e.add_field(name="📋 인증 로그", value=f"<#{self.log_channel_id}>" if self.log_channel_id else "⚪ 미설정", inline=True)
             e.add_field(name="🎭 인증 역할", value=f"<@&{self.role_id}>" if self.role_id else "⚪ 미설정", inline=True)
             e.add_field(name="🖼️ 패널", value=f"사진 {'설정됨' if self.image_url else '없음'} · 버튼 `{self.button_text}`", inline=False)
             if self.top_text or self.bottom_text:
-                preview = ((self.top_text + "\n\n") if self.top_text else "") + ((self.bottom_text) if self.bottom_text else "")
+                preview = ((self.top_text + "\n\n") if self.top_text else "") + self.bottom_text
                 e.add_field(name="패널 문구", value=preview[:1024], inline=False)
-            e.add_field(name="🔒 개인정보", value="IP 로그를 켜면 인증 요청 시 서버에 접속 IP가 기록됩니다. 서버 이용자에게 수집 목적과 보관 정책을 별도로 안내하세요.", inline=False)
             return e
 
         async def redraw(self, interaction):
@@ -280,10 +345,17 @@ def install(core) -> None:
         view = SettingsView(interaction.guild.id, initial)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
+    # Remove any stale command with the same name before registering the
+    # canonical implementation. This prevents two /인증설정 entries.
+    existing = bot.tree.get_command("인증설정")
+    if existing is not None:
+        bot.tree.remove_command("인증설정", type=discord.AppCommandType.chat_input)
+        log.warning("Removed stale duplicate slash command: /인증설정")
+
     command = app_commands.Command(
         name="인증설정",
-        description="CAPTCHA, 접속 IP 로그, 인증 로그, 역할, 인증패널을 한 곳에서 설정합니다.",
+        description="인증 관련 설정을 한 곳에서 관리합니다.",
         callback=settings_command,
     )
     bot.tree.add_command(command)
-    log.info("Unified /인증설정 installed: single command, save-and-run verification control center")
+    log.info("Unified /인증설정 installed: public panel uses only user text/image")
