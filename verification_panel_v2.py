@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Final unified verification settings panel.
-
-Replaces duplicate /인증설정 registrations with one command and restores
-image-URL based verification panel publishing. All verification settings are
-kept behind the single settings command.
-"""
+"""Final unified verification settings panel."""
 from __future__ import annotations
 import discord
 from discord import app_commands
@@ -147,7 +142,7 @@ def install(core):
         def __init__(self,p):
             self.p=p; super().__init__(label="패널 디자인 / 이미지 URL",emoji="🖼️",style=discord.ButtonStyle.secondary,row=3)
         async def callback(self,i):
-            if not admin_ok(i): return await i.response.send_message("❌ 서버 관리자 권한이 필요합니다.",ephemeral=True)
+            if not admin_ok(i): return await i.response.send_message("❌ 관리자 권한이 필요합니다.",ephemeral=True)
             await i.response.send_modal(DesignModal(self.p))
 
     class Save(discord.ui.Button):
@@ -164,9 +159,12 @@ def install(core):
                 parts=[]
                 if self.p.top_text: parts.append(self.p.top_text)
                 if self.p.bottom_text: parts.append(self.p.bottom_text)
-                e=discord.Embed(title="🔐 서버 인증",description="\n\n".join(parts) or "아래 버튼을 눌러 인증을 진행하세요.",color=discord.Color.blurple())
-                if self.p.image_url: e.set_image(url=self.p.image_url)
-                e.set_footer(text="DinoBot · 인증 시스템")
+                e=discord.Embed(title="🔐 서버 인증",color=discord.Color.blurple())
+                custom_text="\n\n".join(parts).strip()
+                if custom_text:
+                    e.description=custom_text
+                if self.p.image_url:
+                    e.set_image(url=self.p.image_url)
                 await i.channel.send(embed=e,view=VerificationView(g.id,self.p.button_text or "인증하기"))
                 await i.edit_original_response(content="✅ 인증 설정 저장 및 실행 완료\n🖼️ 이미지 URL 패널이 현재 채널에 생성되었습니다.",embed=self.p.settings_embed(),view=self.p)
             except Exception as ex:
